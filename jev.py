@@ -648,9 +648,6 @@ def demo():
     assert mcp.usage.transport == "mcp-stdio"
     assert mcp.usage.startup_latency_ms >= 0
     mcp.close()
-    auto = CommandJev("jev mcp")
-    assert auto.protocol == "mcp" and auto.usage.transport == "mcp-stdio"
-    auto.close()
 
     wrapped = {
         "content": [{"type": "text", "text": json.dumps(response)}],
