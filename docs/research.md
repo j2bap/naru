@@ -1,80 +1,106 @@
 # Architecture and research
 
+[README](../README.md) · [Benchmark guide](benchmark.md) · [Published results](../results/published/README.md)
+
+Use the [setup](setup.md) and [daily-use](usage.md) guides to share memory with
+your agents. This page explains the underlying design, the research loop, and
+what the measurements support.
+
 ## How it works
 
-Naru has two layers.
+Naru combines a local log with a document you curate.
 
-**The log.** Naru implements [Context as an Environment: Programmatic Context
-Management for Long-Horizon Agents](https://arxiv.org/abs/2608.21690). History
-lives in a SQLite log addressed by sequence number. In the agent loop, the
-model reaches that history by writing Python, and only what the code prints
-enters the next model call. `ms.py` is the log, `kernel.py` is the persistent
-Python namespace, and `eviction.py` is the paper's Algorithm 1.
+| Layer | What it holds | How you use it |
+| --- | --- | --- |
+| Log | Notes, proposals, tool output, and research history, addressed by sequence number. | Search or read only the entries you need. |
+| Approved document | Claims and procedures you promote. | Load them into agent sessions through hooks or instruction files. |
 
-**The curation layer.** This part is not in the paper. Agents propose, you
-decide, and only approved items reach the doc. The doc stays small while the
-log grows. Four columns carry it:
+The log implements
+[Context as an Environment: Programmatic Context Management for Long-Horizon Agents](https://arxiv.org/abs/2608.21690).
+In the research loop, the model writes Python to inspect history. Only the
+text that code prints enters the next model call. `ms.py` owns the SQLite log,
+`kernel.py` holds the persistent Python namespace, and `eviction.py` implements
+the paper's Algorithm 1 for managing the context budget.
 
-| Column      | Meaning                                                                       |
-| ----------- | ----------------------------------------------------------------------------- |
-| `promoted`  | Your decision. A rejected row stays readable at its `seq`.                    |
-| `topic_key` | Groups claims about one thing. Two approved claims on one key are a conflict. |
-| `base_seq`  | The doc version when the claim was written. `inbox` shows how far it moved.   |
-| `scope`     | The repository a fact holds in. Empty for a general fact.                     |
+The curation layer adds human review. Four fields track each proposal:
 
-The `naru` command and its hooks use the curation layer and the log. The agent
-loop and the benchmark use the log and the kernel.
+| Field | Purpose |
+| --- | --- |
+| `promoted` | Records whether the item is pending, approved, archived, or rejected. |
+| `topic_key` | Groups items about one topic. Multiple approved items of the same kind and scope create an unresolved group. |
+| `base_seq` | Records the document version used when the item was proposed. |
+| `scope` | Identifies a repository, or leaves the fact general. |
 
-Read [How it works](../how-it-works.html) for a visual walkthrough.
+The CLI and memory hooks use the log and curation layer. The research agent
+and benchmark use the log and Python kernel. The
+[visual walkthrough](../how-it-works.html) shows the flow.
 
 ## Reference results
 
-The benchmark checks that this code behaves like the paper's system. It does
-not claim a new result. This is the reference run: LongMemEval-S, 96
-questions, Sonnet 5, judged by Haiku 4.5. The rows are in
-[`results/published/`](../results/published/), stripped of gold answers.
+The reference run uses LongMemEval-S with **96 questions**, Sonnet 5 as the
+answerer, and Haiku 4.5 as the judge. These are historical model labels from
+the [published run](../results/published/v17_sonnet_n96.json).
 
-| Arm    | Correct | 95% CI | Largest context | Calls | Model cost per question |
-| ------ | ------- | ------ | --------------- | ----- | ----------------------- |
-| `naru` | 72/96   | 65-83% | 2,174 tokens    | 3.7   | $0.3547                 |
-| `full` | 64/96   | 57-75% | 124,073 tokens  | 1.0   | $0.8036                 |
-| `rag`  | 59/96   | 51-71% | 2,142 tokens    | 1.0   | $0.0753                 |
+| Arm | Correct | 95% confidence interval | Mean peak view | Mean calls | Model cost per question |
+| --- | --- | --- | --- | --- | --- |
+| `naru` | 72/96 | 65–83% | 2,174 tokens | 3.7 | $0.3547 |
+| `full` | 64/96 | 57–75% | 124,073 tokens | 1.0 | $0.8036 |
+| `rag` | 59/96 | 51–71% | 2,142 tokens | 1.0 | $0.0753 |
 
-`full` puts the whole history in the prompt. `rag` pastes the top 8 keyword
-hits. `naru` keeps the history in the log and lets the model query it with
-code. The cost column excludes the judge, which costs about $0.027 per question
-for every arm.
+`full` puts the whole history in the prompt. `rag` supplies the top eight
+keyword matches. `naru` lets the model query the log with code.
 
-Read this table with care:
+**Mean peak view** averages each question's largest recorded view. It is not
+the run's maximum or a provider-billed token count. Model cost excludes the
+judge, which adds about $0.027–$0.029 per question in this run.
 
-- No arm beats another at the corrected significance threshold. A smaller
-  Haiku run puts `rag` ahead of `naru`.
-- `naru` holds about 57 times less context than `full`, but `rag` is about 4.7
-  times cheaper than `naru`.
-- The judge is not LongMemEval's official prompt, so you cannot compare these
-  numbers with published scores.
+Keep these limits with the numbers:
 
-[Measure Naru](benchmark.md) has the full method, per-category results,
-and how to run the benchmark with other models. [Context policy and
-Jev](context-policy.md) covers the optional context gate in the agent
-loop.
+- No pair of arms reaches the significance threshold after correction for
+  three comparisons. A smaller Haiku run ranks `rag` above `naru`.
+- The mean peak view for `naru` is about 57 times smaller than `full`.
+  The model cost for `rag` is about 4.7 times lower than `naru`.
+- The judge differs from LongMemEval's official prompt. These scores are not
+  leaderboard-comparable.
+- This benchmark measures the research loop. It does not establish whether
+  approved facts improve everyday coding tasks.
+
+The [benchmark guide](benchmark.md) explains the controls, errors, paired
+statistics, and category results. The
+[published-results guide](../results/published/README.md) lets you recompute the
+table without an API call. The curation layer has a
+[separate paired check](benchmark.md#paired-curation-check), with no published
+production result yet.
 
 ## Limitations
 
-- **Conflict checks use exact keys.** Two contradictory claims under different
-  `--key` values both appear as approved.
-- **One database on one machine.** Two databases would break `seq` as a total
-  order.
-- **Search is BM25 keyword search**, as in the paper. The optional `rsm`
-  benchmark arm uses embeddings but does not change runtime search.
-- **The agent loop runs model-written code in your process** by default. This
-  applies to `agent.py` and the benchmark. The `naru` command and its hooks do
-  not run model-written code. `NARU_KERNEL=sandbox` moves the kernel to a child
-  process with CPU, memory, and file-size limits and a timeout. That is process
-  isolation, not a sandbox: the child has your user, filesystem, and network.
-  Set `NARU_KERNEL_JAIL` to wrap it in `sandbox-exec`, `bwrap`, or a container.
-  macOS refuses `RLIMIT_AS`, so memory is not capped there, and `limits()` says
-  so.
-- **Curation has no published production result yet.** It has self-checks and
-  a [paired live-check harness](benchmark.md#paired-curation-check).
+- Conflict detection uses exact keys within a kind and scope. Contradictory
+  facts under different keys can both remain approved.
+- Naru uses one local database. It does not merge independent stores or sync
+  them between machines; sequence numbers belong to their store.
+- Runtime search uses BM25 keyword matching. The optional `rsm` benchmark arm
+  uses embeddings but does not change CLI search.
+- You control document size by choosing what to promote. The 400-byte item
+  limit does not impose a total document budget.
+- Human review is a workflow rule. An agent with CLI access can pass `--yes`
+  to a decision command.
 
+### Execution limits
+
+The research loop in `agent.py` and the benchmark executes model-written
+Python in your process by default. It has your process's access to files and
+the network. Normal memory commands and memory hooks do not run model-written
+code. Stale checks run the command attached to the claim.
+
+`NARU_KERNEL=sandbox` moves the research kernel into a child process with
+timeouts and requested CPU, memory, and file-size limits. Despite the setting's
+name, this alone does not provide a security sandbox. The child still runs as
+your user with your filesystem and network access.
+
+Set `NARU_KERNEL_JAIL` to wrap the child with an external tool such as
+`sandbox-exec`, `bwrap`, or a container. Choose and configure that isolation
+for your environment. macOS refuses `RLIMIT_AS`, so that path cannot enforce
+the memory cap there; `limits()` reports the refusal.
+
+For the optional policy that selects context within a budget, see
+[Context policy and Jev](context-policy.md).

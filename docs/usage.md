@@ -1,265 +1,212 @@
-# Use Naru
+# Daily use
 
-[Back to the quick start](../README.md#-get-started).
+[README](../README.md) · [Agent setup](setup.md) · [Commands](commands.md)
 
-## Connect your agent
+Naru has two places for memory: a searchable local log and a document of facts
+you approve. You can save more in the log than you want to load into every
+agent session.
 
-Pick one setup for each harness you use:
+[Review](#review-your-inbox) · [Save](#save-a-fact-or-procedure) · [Find](#find-saved-context) · [Update](#change-an-approved-fact) · [Repository facts](#facts-for-one-repository) · [Large output](#keep-large-output-out-of-context)
 
-| Harness | Setup | What it does |
-| --- | --- | --- |
-| Claude Code | [`naru claude-hook`](#claude-code) | Loads the doc at session start, refreshes it after each decision, and gives it to subagents. |
-| Codex | [The Codex plugin](#codex) | Does the same through Codex hooks. |
-| Cursor | [`naru inject .cursorrules`](#cursor-and-other-tools) | Writes the doc into the file Cursor reads. |
-| Any tool that runs a shell command | [`naru inject <file>`](#cursor-and-other-tools) | Writes the doc into the file that tool reads. |
-
-The Claude Code hook and the Codex plugin also tell the agent how to file
-claims. With a file-only setup, you add that instruction yourself. See
-[Tell your agent to file claims](#tell-your-agent-to-file-claims).
-
-### Claude Code
-
-`naru claude-hook` loads the approved doc at session start, refreshes it after
-you promote or retire a claim, and gives the doc to subagents. It tells a
-subagent not to file claims, because a subagent cannot judge what is already
-known. Add it to `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [{"matcher": "startup|resume|clear|compact",
-      "hooks": [{"type": "command", "command": "naru claude-hook", "timeout": 5}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "naru claude-hook", "timeout": 2}]}],
-    "SubagentStart": [{"hooks": [{"type": "command", "command": "naru claude-hook", "timeout": 5}]}]
-  }
-}
-```
-
-If a file Claude Code loads at start already holds the doc, the hook sends only
-the filing instructions, so the doc does not appear twice.
-
-To use a file instead of the hook, write the doc into the file Claude Code
-loads in every folder:
+## Review your inbox
 
 ```bash
-naru inject ~/.claude/CLAUDE.md
+naru inbox
 ```
 
-### Codex
+Read each proposal, then type a choice or its first letter:
 
-The Codex plugin loads the approved doc for you, so you do not need to run
-`inject`. Install it from the naru folder, after `naru` is on your `PATH`:
+| Choice | Effect |
+| --- | --- |
+| **Promote** (`p`) | Add the fact to approved memory. |
+| **Archive** (`a`) | Keep it out of approved memory, but leave it available as a lead. |
+| **Reject** (`r`) | Mark it wrong and exclude it from automatic archive recall. |
+| **Skip** (`s`) | Leave it pending for a later review. |
+
+Approve facts that will help again, such as a tool quirk or a non-standard
+working rule. Use a repository fact for a rule that applies to one project.
+Each approved fact adds text to future sessions, so keep it focused.
+
+Your decision updates registered instruction files. Hooks deliver a changed
+document at the next prompt or session event. Run `naru inject` without a path
+to inspect the current approved document.
+
+## Save a fact or procedure
+
+Agents with the memory hooks receive filing instructions. You can also file a
+claim yourself:
 
 ```bash
-codex plugin marketplace add "$PWD/codex"
-codex plugin add naru-codex@naru
+naru claim "Naru CLI help is at the top level: run naru --help." \
+  --key naru.help --by you
 ```
 
-Start a new Codex thread and trust the plugin hooks when Codex asks. The plugin
-loads the approved doc at session start, refreshes it after you promote or
-retire a claim, and gives the same doc to subagents. It tells a subagent not
-to file claims, because a subagent cannot judge what is already known.
+Use a short, stable `--key` to group facts about the same topic. `--by` records
+who proposed the fact. The command prints its sequence number, which identifies
+that entry in the store.
 
-Codex also reads `AGENTS.md` in its home folder, `$CODEX_HOME`, which is
-`~/.codex` when the variable is not set. If you write the doc there, session
-start sends only the filing instructions:
+For a repeatable procedure, use `skill`:
 
 ```bash
-naru inject "${CODEX_HOME:-$HOME/.codex}/AGENTS.md"
+naru skill "To review Naru memory, run naru inbox, decide each item, then run naru inject to inspect the approved document." \
+  --key naru.review --by you
 ```
 
-The plugin stores only the last doc sequence and fingerprint that each Codex
-session saw. That data lives in a `context_delivery` table, not in the
-searchable log.
-
-The plugin does not replace Codex tool results. In Codex 0.152, the only
-working way to replace a result marks the tool as blocked after it already ran,
-which can make an agent repeat a write or a request.
-
-### Cursor and other tools
-
-For a harness without hooks, write the doc into the file it reads:
+Both commands create pending items. Review them with `naru inbox`. Each claim
+or skill can contain at most **400 UTF-8 bytes**. Save longer material as a
+note instead:
 
 ```bash
-naru inject .cursorrules     # Cursor, in each project
-naru inject AGENTS.md        # DeepSeek Harness, or any tool that reads AGENTS.md
+naru add "release notes" < notes.md
 ```
 
-Run `inject` once per file. Naru records the file, and every later `promote`
-or `drop`, including a decision in `naru inbox`, writes the new doc into it.
-To stop Naru writing a file, delete the markers. Without a path,
-`naru inject` prints the doc to stdout.
+Naru saves notes by paragraph so search can return the relevant part.
 
-A file inside a project, such as `.cursorrules`, is often committed. If it is,
-your approved facts are committed with it.
-
-### Tell your agent to file claims
-
-The Claude Code hook and the Codex plugin already send this instruction. For a
-file-only setup, add it to the file yourself, outside the Naru markers:
-
-```markdown
-## Naru
-
-File one lasting fact per claim:
-
-    naru claim "<text>" --key <topic> --by <agent>
-
-For a repeatable procedure, use `naru skill` instead of `naru claim`. A claim or skill holds at most
-400 bytes, so the doc stays small.
-```
-
-### Claude Code hook for large output
-
-A single command can print thousands of lines into your agent's context.
-`hook_spill.py` is a `PostToolUse` hook that moves large tool output into the
-Naru log and leaves a short preview with a recovery handle in its place. The
-agent runs `naru show <seq>` if it needs the full text. `show` prints at most
-20,000 characters per call, which fits the output limits of Claude Code and
-Codex, and ends with the command that prints the rest.
-
-To bound one large command yourself, pipe its output through `naru spill`.
-Output under 2,400 characters passes through unchanged. Larger output goes
-into the log, and you get a preview with a recovery handle. The preview keeps
-the first and last 300 characters and a few line signposts.
-
-To change these sizes, set `NARU_SPILL_THRESHOLD` or `NARU_SPILL_PREVIEW` in
-your environment. If you set them only on the hook command, `naru stats`
-judges output against a threshold that the hook did not use.
-
-Add this to your Claude Code `settings.json`:
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /path/to/naru/hook_spill.py"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-`naru stats` shows how often output spills and how often an agent reopens it.
-It counts a spill as reopened only when a later `naru show` covers that exact
-spill.
-
-## Keep facts current
-
-### Change an approved fact
-
-Retire the old claim first, then approve the new one:
+## Find saved context
 
 ```bash
-naru drop 1 --yes
-naru claim "Run tests with: make check" --key tests --by you
-naru promote 2 --yes
+naru search "Naru help"
+naru outline
 ```
 
-If you approve two claims on the same `--key` without retiring one, Naru shows
-both under `## Unresolved`. It never picks one for you:
+Search returns up to eight matches by default. Each result starts with a
+sequence number. `outline` lists saved session ranges for browsing.
 
-```markdown
-## Unresolved
-▲ claim tests — 2 versions
-  · claude: Run tests with: make test
-  · codex: Run tests with: make check
-```
-
-### Facts for one repository
-
-Some facts hold only in one repository. Add `--repo` when you file one:
+Use the number from your result to read the entry. For example, if it is `12`:
 
 ```bash
-naru claim "Run the export with: node scripts/export.mjs" --key export --repo
+naru show 12
 ```
 
-Naru names the repository `owner/name` from its `origin` URL, or by its folder
-name when it has no remote. A repository fact never goes into the general doc or
-into any file, because a repository's `AGENTS.md` is usually committed. The
-Codex and Claude Code hooks add the facts for the folder the session runs in,
-under `## This repository (owner/name)`.
+To read a range, use `naru show 12 18`. A call prints up to 20,000 characters
+by default. If more remains, copy the continuation command Naru prints.
 
 ### Archive and reject
 
-`naru drop` archives a claim. It leaves the doc, but it can still come back as
-a lead. On each prompt, the Codex and Claude Code hooks add up to three
-archived or pending claims that share at least two significant words with the
-prompt, under "From the Naru archive (unreviewed)" with each claim's date.
+Archived and pending claims can still help as leads. On each prompt, the
+Claude Code and Codex hooks can add up to three matching claims under
+**From the Naru archive (unreviewed)**. The section includes dates and asks the
+agent to verify the claims. A match needs two significant prompt words, or the
+one significant word when the prompt has only one.
 
-`naru reject` marks a claim wrong, and the hooks never show it. Run `naru drop`
-on a rejected claim to archive it again.
+Rejected claims do not appear in this automatic recall. They remain in the
+log, where an explicit search or `show` can still find them. To change a
+rejected claim back into an archived lead, use `naru drop SEQ --yes` with its
+sequence number.
 
-### Checks for stale facts
+## Change an approved fact
 
-A fact that depends on a tool version or on files can carry a check:
-
-```bash
-naru claim "Codex 0.163 ignores X" --key codex.x --check "codex --version"
-naru check 12 "/bin/bash --version" --yes   # add a check to an approved fact
-```
-
-Naru runs the check when you approve the fact and saves its output. Each
-`naru inbox` runs the checks again. A fact whose output changed shows up as
-`[stale]`, and you keep it or retire it. A check runs without a shell, from your
-home folder, for at most 10 seconds.
-
-### See pending claims in your status line
-
-Pending claims wait until you run `naru inbox`, and nothing reminds you.
-`prune` deletes a pending claim after 30 days, so a claim you never look at is
-the only kind that expires. Add this to your status line script to show a
-count:
+Retire the old fact, then propose and approve its replacement. First find the
+old sequence number with `naru search`. If that number is `12`:
 
 ```bash
-db="${NARU_DB:-$HOME/.naru/log.db}" cache="${TMPDIR:-/tmp}/naru-pending.$UID"
-if [[ $db -nt $cache ]]; then
-  sqlite3 -readonly "$db" \
-    "SELECT COUNT(*) FROM conversation_history WHERE kind='claim' AND promoted=0" \
-    >"$cache" 2>/dev/null
-fi
-read -r pending <"$cache" 2>/dev/null
-((pending > 0)) && printf ' ✉%d' "$pending"
+naru drop 12 --yes
 ```
 
-The cache refreshes only when the database changes, so the count is never
-stale. A cached render costs nothing you can measure, against 11.5 ms for the
-query. It prints nothing when the inbox is clear or the store does not exist
-yet.
+File the replacement with the same `--key`, then review it with `naru inbox`.
+Use the actual sequence number from your store whenever you run a decision
+command.
 
-## Commands
+If two approved claims share the same key and scope, Naru puts both under
+`## Unresolved`. It leaves the choice to you. Use `naru drop` to retire the
+old version, or `naru reject` if it is wrong. Claims and skills have separate
+key groups. Naru does not detect contradictions between different keys.
 
-| Command                                 | What it does                                   |
-| --------------------------------------- | ---------------------------------------------- |
-| `naru claim "<text>" [--key K] [--by A]` | Propose a fact.                                |
-| `naru claim ... --repo` or `--check CMD`  | Scope a fact to this repo, or attach a check.  |
-| `naru skill "<procedure>" [--key K]`    | Propose a repeatable procedure.                |
-| `naru inbox`                            | Promote, archive, reject, or skip items.       |
-| `naru inject [PATH]`                    | Write the approved doc to a file or stdout.    |
-| `naru promote SEQ --yes`                | Approve without the prompt.                    |
-| `naru drop SEQ --yes`                   | Archive or retire without the prompt.          |
-| `naru reject SEQ --yes`                 | Mark a claim wrong so the hooks never show it. |
-| `naru check SEQ "<command>" --yes`      | Add a stale check to an approved fact.         |
-| `naru add "<topic>" < notes.md`         | Save a note to the log.                        |
-| `naru search QUERY`                     | Find matching lines in the log.                |
-| `naru show SEQ [SEQ] [--at N]`          | Print an entry or range, 20,000 chars a call.  |
-| `naru outline`                          | Show an index of the log.                      |
-| `naru spill [--tool T] [--session S]`   | Store large stdin in the log; print a preview. |
-| `naru stats [DAYS]`                     | Show spill and recovery counts.                |
-| `naru prune [DAYS] [--dry-run]`         | Delete old pending claims and log rows.        |
-| `naru gc`                               | Remove orphaned blobs from this store.         |
-| `naru claude-hook`, `naru codex-hook`   | Hook commands. Claude Code and Codex run them. |
+`promote`, `drop`, `reject`, and `check` require `--yes` when they run without
+a terminal. This prevents accidental scripted decisions. It is not an access
+control: an agent that can run the command can also pass `--yes`.
 
-Everything lives in `~/.naru/log.db`. Set `NARU_DB` to use another file.
+## Facts for one repository
 
-`promote` and `drop` refuse to run without a terminal unless you pass `--yes`.
-This stops a tool loop from approving by accident. It is not a security
-boundary, because anything that can run the CLI can also pass `--yes`.
+File the claim from inside its Git repository and add `--repo`. For example,
+from your Naru checkout:
 
+```bash
+naru claim "Naru's offline store check is: python3 ms.py." \
+  --key checks.store --by you --repo
+```
+
+Review it with `naru inbox`. The Claude Code and Codex hooks deliver approved
+repository facts only for the matching repository, under
+`## This repository (owner/name)`.
+
+Naru derives `owner/name` from the `origin` URL. With no remote, it uses the
+repository folder name. It does not write repository facts into the general
+document or any injected file. A file-only integration therefore does not
+receive them.
+
+## Check for stale facts
+
+If a fact depends on a tool or file that can change, attach a command whose
+output will change with it. For an approved claim at sequence `12`:
+
+```bash
+naru check 12 "python3 --version" --yes
+```
+
+This runs the command and saves its output. You can also attach a check while
+filing a claim with `--check "COMMAND"`; that check first runs when you approve
+the claim.
+
+Each `naru inbox` reruns checks on approved items. If the saved output differs,
+Naru lists the fact as `[stale]`. Choose **keep** to confirm it and save the new
+output, **drop** to archive it, or **skip** to leave it for later.
+
+Check commands run from your home directory, without a shell, for at most
+10 seconds. Use absolute file paths. Shell pipes, redirects, and variable
+expansion do not work unless you explicitly invoke a shell. Review the command
+before you approve a claim that carries one.
+
+## Keep large output out of context
+
+Pipe saved output through `naru spill`:
+
+```bash
+naru spill --tool build < build.log
+```
+
+Output of up to 2,400 characters passes through unchanged. Larger output goes
+into the log. Naru returns a preview with the first and last 300 characters,
+line signposts, and a `naru show` command to recover the text.
+
+Copy that recovery command when you need the full result. `show` prints in
+pages and tells you how to continue. To spill a live command, pipe its output
+to `naru spill`; use your shell's pipeline exit handling if the original
+command's failure status matters.
+
+Claude Code can do this through an
+[optional output hook](setup.md#optional-claude-code-output-hook). The Codex
+plugin does not replace tool output.
+
+```bash
+naru stats
+naru stats 7
+```
+
+These commands show spill and recovery counts for all recorded time or the
+last seven days. A spill counts as reopened only when a later `show` covers
+that exact spill. See [settings](commands.md#settings) to change the threshold
+and preview size. Apply the same settings to the hook and CLI so their reports
+agree.
+
+## Clean up old log entries
+
+Preview the effect before you delete old rows:
+
+```bash
+naru prune 30 --dry-run
+```
+
+If the preview matches what you want, run `naru prune 30` to delete eligible
+rows older than 30 days. This can include pending claims, notes, and spilled
+output. Naru preserves decided claims and skills, including archived and
+rejected ones. It also preserves log evidence cited by approved items.
+
+Pruning runs only when you request it. The default age is 30 days if you omit
+the number. `naru gc` removes orphaned payload files that no remaining row
+references.
+
+## Connect your agent
+
+Use the [setup guide](setup.md) for hooks, plugins, and instruction files.
+For every command and option, use the [command reference](commands.md).

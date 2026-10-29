@@ -1,186 +1,227 @@
-# Measure Naru
+# Benchmark guide
 
-This page explains how to run the benchmark, how to read its numbers, and how
-to check whether approved context helps real tasks. For a short summary, see
-the [README](../README.md#does-it-work).
+[README](../README.md) · [Architecture and results](research.md) · [Published rows](../results/published/README.md)
 
-## The benchmark
+Use this guide to run the research benchmark, inspect its controls, or test
+whether approved memory helps your tasks. For ordinary memory setup, start
+with the [user guides](../README.md#guides).
 
-`bench.py` runs [LongMemEval](https://arxiv.org/abs/2410.10813) (ICLR 2025)
-over four arms on identical history:
+The benchmark makes live model calls and can cost money. Its `naru` arm also
+runs model-written Python. Read the
+[execution limits](research.md#execution-limits) before you run it. You can
+[recompute the published results](../results/published/README.md) offline.
 
-| Arm    | What fills the prompt                                               |
-| ------ | ------------------------------------------------------------------- |
-| `full` | The whole history in one prompt.                                    |
-| `rag`  | The top 8 BM25 hits, answered in one call.                          |
-| `naru` | Nothing. The history stays in the log and the model reaches it with code. |
-| `rsm`  | Grouped dense-retrieval chunks, answered in one call.               |
+## What you measure
 
-The default arms are `full,rag,naru`. `rag` is the control. It holds the
-kernel fixed and changes only what fills the prompt, so it separates
-"programmatic access wins" from "any retrieval beats stuffing". Do not drop it.
+`bench.py` runs [LongMemEval](https://arxiv.org/abs/2410.10813) questions with the
+same source history across these arms:
 
-```bash
-mkdir -p data && cd data
-curl -LO https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json
-cd ..
-python3 bench.py --split oracle -n 12
-```
+| Arm | What the model receives |
+| --- | --- |
+| `full` | The whole history in one prompt. |
+| `rag` | The top eight BM25 keyword matches, answered in one call. |
+| `naru` | A bounded working view, with Python access to history in the log. |
+| `rsm` | Grouped chunks selected through embeddings, answered in one call. |
 
-All arms report estimated total and peak prompt tokens, including the system
-text and retries. Naru also reports its bounded dynamic-view peak separately.
+The default is `full,rag,naru`. Keep `rag` in comparisons of retrieval methods:
+it controls for the benefit of retrieving a small part of the history. The
+optional `rsm` arm needs an embedding adapter.
 
-### What the benchmark is for
+This benchmark checks the implementation and catches regressions. It uses a
+different judge prompt from official LongMemEval, so its scores are not
+leaderboard-comparable. The implemented paper reports 94.8 on LongMemEval-S,
+73.1 on BEAM-10M, and 86.7 on LOCA-256K against ten named baselines. The runs
+here do not establish an improvement on those results.
 
-It checks whether this implementation behaves like the one in the paper. It is
-not a contribution to the field, and the numbers are not leaderboard-comparable.
-The judge is not LongMemEval's official prompt. The paper already reports 94.8
-on LongMemEval-S, 73.1 on BEAM-10M and 86.7 on LOCA-256K against ten named
-baselines. Nothing here improves on that. The benchmark tells you whether a
-change to this repo broke something.
+## Run a small benchmark
 
-### The `rsm` arm
-
-The `rsm` arm needs `NARU_EMBED`, so it stays out of the default command. The
-command reads one JSON object on stdin with a `texts` array and writes one JSON
-object with a same-length `vectors` array. Naru validates and normalizes every
-vector. It records the command's program name only, not its arguments.
+From the repository root, download the oracle split:
 
 ```bash
-NARU_EMBED='./embed-bge-large' python3 bench.py --arms rag,rsm --split oracle -n 12
+mkdir -p data
+curl --fail -L \
+  -o data/longmemeval_oracle.json \
+  https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json
 ```
 
-The `rsm` arm defaults to six atoms, five turns per chunk, a 0.85 merge
-threshold, and a 4,000-token source budget. The 0.85 value is the paper's BGE
-setting. You must calibrate it for another embedding space. The report records
-embedding input tokens, atoms, selected members, timing, source tokens, and
-estimated prompt tokens. Model cost does not include embedding-provider cost,
-because the harness cannot know it.
-
-## The reference run
-
-The accuracy and cost table for the reference run is in the
-[README](../README.md#does-it-work). It lives there only, so the two pages
-cannot drift apart. This section has the statistics behind it.
-
-"Largest context" is the largest view the model ever held, as measured by the
-harness. The cost column is the arm's own cost. It excludes the judge, so it
-measures the arm and not the grader.
-
-```
-separability — paired McNemar, Bonferroni for 3 pairs
-    dropped from the pairing (run errored): full 5
-    full  vs rag     9.9 pts to full   full only 14, rag only  5   p=0.064   not separable
-    full  vs naru    3.3 pts to naru   full only 11, naru only 14  p=0.690   not separable
-    rag   vs naru   13.5 pts to naru   rag  only  9, naru only 22  p=0.029   not separable
-```
-
-Three arms mean three tests, so the threshold is Bonferroni-corrected to
-0.0167. `rag` vs `naru` clears a plain 0.05 but not the corrected threshold, so
-the harness correctly calls it not separable.
-
-### Where the difference sits
-
-| Category                   | `full` | `rag` | `naru` | naru vs rag |
-| -------------------------- | ------ | ----- | ------ | ----------- |
-| knowledge-update           | 13/16  | 13/16 | 13/16  | p=1.000     |
-| multi-session              | 10/16  | 7/16  | 8/16   | p=1.000     |
-| single-session-assistant   | 13/15  | 15/16 | 15/16  | p=1.000     |
-| single-session-user        | 14/14  | 15/16 | 15/16  | p=1.000     |
-| single-session-preference  | 4/16   | 2/16  | 7/16   | p=0.125     |
-| **temporal-reasoning**     | 10/14  | 7/16  | 14/16  | **p=0.039** |
-
-Four categories are a tie. The whole difference is in temporal reasoning and
-preference following. In those two, the model must compute an answer over the
-log instead of quoting one turn. A top-8 keyword window can retrieve a turn,
-but it cannot do arithmetic across sessions.
-
-The paper predicts this shape, which makes this a reproduction check and not a
-result. The paper's own ablation says the eviction index
-affects preference following most (89.1 vs 74.9), so that category was
-predicted before it was measured. Temporal reasoning was not. These are
-post-hoc tests on six categories, so treat the p-values as descriptive.
-
-### Read the numbers honestly
-
-- **Do not quote `billed_input` or `net-of-harness` ratios.** The `claude`
-  CLI's usage data is not consistent across runs. The same `full` prompt
-  reported 201,288 billed input tokens at n=12 and 47,151 at n=96, for the same
-  view size and nearly the same cost. Cost comes from the CLI's own
-  `total_cost_usd` and does reconcile. `View` comes from the harness. Those two
-  are safe.
-- **A question whose run errored leaves the pairing.** It does not score as a
-  wrong answer. McNemar reads only the discordant pairs, so one CLI timeout
-  scored as a loss can turn p=0.125 into p=0.031 and invent a significance
-  claim. `report()` prints accuracy twice when that happens.
-- **Run `noise.py` over two replicate runs** before you read anything into a
-  gap. At n=12 the run-to-run band is about 33 points. Two identical Sonnet
-  runs disagreed on a third of the questions and still landed on the same
-  total. The n=24 Haiku run in `results/published/` shows `rag` ahead of
-  `naru`, and the n=96 Sonnet run reverses it. Single-model, small-n orderings
-  from this harness do not survive.
-
-## Other models
-
-The benchmark uses one provider-neutral contract for the answerer and the
-judge: prompt on stdin, text out. By default, `--backend auto` selects an
-installed Codex CLI first, then the Claude CLI. The run config and every row
-record the resolved provider, so the benchmark cannot mix runtimes in silence.
+Use a configured, authenticated model backend. For Codex:
 
 ```bash
-python3 bench.py --backend auto \
-  --model gpt-5.6-luna --judge-model gpt-5.6-luna \
+python3 bench.py --backend codex --split oracle -n 12 --tag first-run
+```
+
+This writes `results/first-run_oracle_n12.json`. The oracle split and 12
+questions provide a small check; they do not reproduce the 96-question
+LongMemEval-S reference run.
+
+For a reproducible comparison, set the backend, answerer, and judge explicitly.
+Replace `MODEL_ID` and `JUDGE_ID` with IDs supported by that backend:
+
+```bash
+python3 bench.py --backend codex \
+  --model MODEL_ID --judge-model JUDGE_ID \
+  --split oracle -n 12 --tag explicit-run
+```
+
+Use `--backend claude` for the Claude CLI. With no override,
+`--backend auto` selects an installed Codex CLI first, then Claude. The run
+configuration and rows record the resolved provider.
+
+### Use a command backend
+
+The provider contract is a prompt on standard input and answer text on
+standard output. Replace `your-provider-command` with your command:
+
+```bash
+python3 bench.py --backend command \
+  --backend-command 'your-provider-command' \
   --split oracle -n 12
 ```
 
-Use an explicit provider when you reproduce a run:
+`NARU_BACKEND` also accepts a provider command. Generic commands do not supply
+token or dollar measurements unless their adapter reports them.
+
+The Codex adapter parses its JSON event stream and keeps the final agent
+message. Each call starts in an empty temporary workspace with user and project
+rules ignored. This keeps benchmark answers from reading the checkout as task
+context. The adapter records provider token counts. Codex CLI usage does not
+provide a dollar total, so dollar-based comparisons need a verified pricing
+layer.
+
+### Add the embedding arm
+
+Set `NARU_EMBED` to a command that accepts one JSON object with a `texts` array
+and returns one JSON object with a same-length `vectors` array. Naru validates
+and normalizes the vectors. It records the program name, without arguments.
+
+If your adapter is `./embed-bge-large`, run:
 
 ```bash
-python3 bench.py --backend codex --model gpt-5.6-luna --judge-model gpt-5.6-luna
-python3 bench.py --backend claude --model claude-haiku-4-5-20251001
-python3 bench.py --backend command --backend-command 'ollama run llama3.2'
+NARU_EMBED='./embed-bge-large' python3 bench.py \
+  --arms rag,rsm --split oracle -n 12
 ```
 
-The Codex backend parses its JSON event stream, keeps only the final agent
-message, and records provider token counts. Each call starts in an empty
-temporary workspace with user and project rules ignored, so the coding-agent
-CLI cannot read the benchmark checkout as part of an answer. Codex CLI usage
-does not give a dollar total, so cost per successful task stays unknown unless
-you supply a verified pricing layer.
+The defaults are six retrieved atoms, five turns per chunk, a 0.85 merge
+threshold, and a 4,000-token source budget. The threshold comes from the
+paper's BGE setting; calibrate it for another embedding space.
 
-`NARU_BACKEND` accepts any command that reads a prompt on stdin. Generic
-commands do not claim token or dollar measurements unless their adapter reports
-them.
+The report includes embedding input tokens, atom and member counts, timing,
+source tokens, and estimated prompt tokens. Model cost excludes the embedding
+provider's cost.
+
+## Read the reference run
+
+The [reference table](research.md#reference-results) is the single summary of
+the 96-question Sonnet run. The
+[published-results guide](../results/published/README.md) reproduces its
+accuracy, confidence intervals, mean peak views, mean calls, and costs.
+
+Current benchmark rows estimate total and peak prompt tokens, including system
+text and retries. The `naru` arm also records its dynamic-view peak. Historical
+rows can have fewer fields; do not treat an absent measurement as zero.
+
+### Paired comparisons
+
+The reference run reports:
+
+```text
+paired McNemar, Bonferroni correction for 3 pairs
+excluded failed runs: full 5
+
+full vs rag    full only 14, rag only  5    p=0.064    not separable
+full vs naru   full only 11, naru only 14   p=0.690    not separable
+rag  vs naru   rag  only  9, naru only 22   p=0.029    not separable
+```
+
+McNemar's test uses questions where the two arms disagree. Three planned
+comparisons give a corrected threshold of **0.0167**. None reaches it.
+The `rag` versus `naru` result crosses 0.05 but does not cross this corrected
+threshold.
+
+Failed model or judge calls stay out of paired tests. They are still visible
+as failures. The raw accuracy table includes all 96 questions; `report()` also
+prints accuracy excluding failed runs when needed. Counting a timeout as a
+paired loss can change a p-value from 0.125 to 0.031 without evidence of better
+answers.
+
+### Category results
+
+These counts exclude failed runs. The p-values compare `naru` with `rag`:
+
+| Category | `full` | `rag` | `naru` | Paired p-value |
+| --- | --- | --- | --- | --- |
+| knowledge-update | 13/16 | 13/16 | 13/16 | 1.000 |
+| multi-session | 10/16 | 7/16 | 8/16 | 1.000 |
+| single-session-assistant | 13/15 | 15/16 | 15/16 | 1.000 |
+| single-session-user | 14/14 | 15/16 | 15/16 | 1.000 |
+| single-session-preference | 4/16 | 2/16 | 7/16 | 0.125 |
+| temporal-reasoning | 10/14 | 7/16 | 14/16 | 0.039 |
+
+The largest observed gaps sit in temporal reasoning and preference following.
+Those tasks can require combining evidence across turns. That is a useful
+hypothesis for further tests; this run does not isolate the cause.
+
+The paper's eviction-index ablation reports 89.1 versus 74.9 on preference
+following, so that category has a prior prediction. Temporal reasoning does
+not. These six category tests are post-hoc. Treat their p-values as descriptive.
+
+### Cost and run-to-run variation
+
+Use the recorded model cost and harness view measurements for these historical
+runs. Do not quote `billed_input` or `net-of-harness` ratios. The Claude CLI
+reported 201,288 billed input tokens for a `full` prompt at n=12 and 47,151 at
+n=96, despite similar view size and cost. Its `total_cost_usd` values do
+reconcile across those runs.
+
+Run the same configuration at least twice, with distinct tags, then compare
+the result files:
+
+```bash
+python3 noise.py results/repeat-a_oracle_n12.json results/repeat-b_oracle_n12.json
+```
+
+Replace those paths with the files from your repeated runs. In the recorded
+n=12 checks, the run-to-run band is about 33 percentage points. Two identical
+Sonnet configurations disagree on a third of the questions while reaching
+the same total score. The published n=24 Haiku comparison ranks `rag` above
+`naru`; the n=96 Sonnet comparison reverses that order. Small runs and one
+model are insufficient to establish a stable ranking.
 
 ## Paired curation check
 
-The benchmark tests the log. `curation_probe.py` tests the curation layer: does
-the approved doc help real tasks, and does it leak into tasks where it should
-not matter?
+Use `curation_probe.py` to test the approved document on your own tasks. It
+runs each task twice with the same model and settings:
 
-It runs each ordinary task twice with the same model and settings. The `plain`
-arm gets no Naru doc. The `naru` arm gets the current approved doc through the
-same context wrapper as the Codex hook. The Claude adapter uses safe mode with
-all tools disabled, so the plain arm cannot read Naru facts from project files.
-A custom provider must give the same isolation.
+| Arm | Context |
+| --- | --- |
+| `plain` | No Naru document. |
+| `naru` | Your approved document through the same wrapper as the Codex hook. |
 
-Write JSONL cases with literal checks:
+The Claude adapter disables all tools, so the plain arm cannot read approved
+facts from project files. A custom provider must provide the same isolation.
+The model sees ordinary task prompts, without arm names, scores, or comparison
+instructions.
+
+Write JSONL cases with literal checks. These examples assume your approved
+memory contains the relevant port fact:
 
 ```json
 {"id":"port","kind":"fact","prompt":"Which port do I use?","must_include":["port 7443"],"must_exclude":["port 443"]}
 {"id":"color","kind":"control","prompt":"Reply with blue.","must_include":["blue"]}
 ```
 
-Use `fact` when approved context should help. Use `control` when it should not
-matter. Keep prompts as ordinary work requests. The model never sees arm names,
-scores, or comparison text. [`cases.jsonl`](../cases.jsonl) is an example set.
-Its fact cases assume your own store holds matching approved claims.
+Use `fact` when approved context should help and `control` when it should not
+affect the answer. The bundled [`cases.jsonl`](../cases.jsonl) has examples;
+its fact cases require matching claims in your store.
 
 ```bash
 python3 curation_probe.py cases.jsonl --out results/curation-live.json
 ```
 
-The report shows paired wins, losses, exact McNemar p-values, harmful carryover
-on controls, prompt size, cost, and elapsed time. Failed model calls stay out of
-the paired score and remain visible as errors. The result file contains full
-answers. It stays ignored under `results/` unless you publish a redacted copy.
+The report shows paired wins and losses, exact McNemar p-values, harmful
+carryover on controls, prompt size, cost, and elapsed time. Failed calls remain
+visible as errors and stay out of paired scores. The result file contains full
+answers and stays ignored under `results/` unless you publish a redacted copy.
+
+For a separate comparison of context-selection policies in the research loop,
+see [Context policy and Jev](context-policy.md#compare-policies).

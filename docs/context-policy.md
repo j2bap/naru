@@ -1,116 +1,130 @@
 # Context policy and Jev
 
-This page covers the optional context policy in the `naru` agent loop. You do
-not need it to use the curation commands in the [README](../README.md).
+[README](../README.md) · [Architecture](research.md) · [Benchmark guide](benchmark.md)
 
-## What the context policy does
+This guide covers an optional policy in the research agent loop. You do not
+need it for claims, inbox review, or agent memory hooks. Benchmark examples
+make live model calls; complete the
+[benchmark setup](benchmark.md#run-a-small-benchmark) first.
 
-Naru stays the memory layer. The agent loop keeps its Event Log, kernel, and
-recovery index. A separate context policy limits the mutable state and the
-latest tool observation that the model sees. Deterministic selection is the
-default.
+## What the policy controls
 
-Jev is a low-overhead typed evaluator. At a pressure checkpoint it receives the
-question, the next action, and metadata for named context blocks, but not their
-bodies. It can recommend `needed`, `useful`, `omit`, or `no_match`. Naru still
-enforces the token budget and keeps required state, Jev-needed blocks, and
-recovery handles. If Jev output is missing or malformed, Naru falls back to
-deterministic selection.
+The agent loop keeps its log, Python kernel, and recovery index. The context
+policy selects how much mutable state and recent tool output enters the next
+model call. Deterministic selection is the default.
 
-The request estimate is capped at 800 tokens. If the metadata or question map
-is larger, Naru skips Jev and uses the deterministic fitter. This keeps the
-main agent's required context instead of overflowing Jev's smaller window.
+Jev is an optional typed evaluator. At a context-pressure checkpoint, it
+receives the question, next action, and metadata for named context blocks.
+It does not receive the block bodies. It returns recommendations such as
+`needed`, `useful`, `omit`, or `no_match`.
 
-## Modes
+Naru enforces the token budget and retains required state, blocks marked needed,
+and recovery handles. Missing or malformed Jev output falls back to
+deterministic selection. If the request estimate exceeds **800 tokens**, Naru
+skips Jev and uses the deterministic policy.
 
-The benchmark exposes two Jev modes:
+## Choose a mode
 
-- `shadow` calls Jev and records what it would have selected.
-- `jev` applies only high-confidence retention and omission decisions.
+| Mode | Behavior |
+| --- | --- |
+| `deterministic` | Select context locally. No Jev call. This is the default. |
+| `shadow` | Call Jev and record its recommendations without applying them. |
+| `jev` | Apply high-confidence retention and omission decisions within Naru's limits. |
+
+For a configured local `jev mcp` command:
 
 ```bash
 NARU_JEV='jev mcp' python3 bench.py \
-  --arms rag,naru --context-policy shadow --split oracle -n 12
-```
-
-For a parent process with the native MCP binding:
-
-```bash
-python3 bench.py --backend codex \
-  --model gpt-5.6-luna --judge-model gpt-5.6-luna \
-  --arms naru --context-policy jev --jev-host-stdio --split oracle -n 12
+  --backend codex --arms rag,naru \
+  --context-policy shadow --split oracle -n 12
 ```
 
 ## Connect Jev
 
-Pick the path that matches your host:
+Choose the adapter that matches your host:
 
-- **Direct call.** When the host can make the MCP call itself, pass a
-  `DirectJev` evaluator to `run_naru`. This avoids a transport process and does
-  not need a Jev key in Naru.
-- **Keyword-shaped host binding.** Use `host_mcp_evaluator(host_evaluate)`,
-  where the MCP-aware parent process supplies `host_evaluate`.
-- **Host MCP over stdio.** For a host that already exposes
-  `mcp__jev__evaluate`, use `--jev-host-stdio`. The benchmark runs model jobs
-  in a parent-owned thread pool, emits `NARU_JEV_REQUEST` records, and waits
-  for one JSON MCP result per record. Only the shared host Jev exchange is
-  serialized. The host owns the MCP key and returns the result over stdin. If
-  the host does not respond, the call times out and Naru falls back to
-  deterministic selection.
-- **Standalone command.** `CommandJev` is persistent by default. It reads one
-  JSON request per line and returns one typed JSON response per line, so you
-  pay startup once per task. `CommandJev(..., persistent=False)` gives a
-  one-shot adapter. `CommandJev` detects `jev mcp` and speaks MCP JSON-RPC over
-  stdio. It also accepts a custom JSON-lines adapter for test doubles and other
-  hosts. The local Jev command needs provider authentication in its own
-  environment.
+| Adapter | Use it when… |
+| --- | --- |
+| `DirectJev` passed to `run_naru` | Your host can call the evaluator directly. No transport process or Jev key in Naru is needed. |
+| `host_mcp_evaluator(host_evaluate)` | Your parent process provides an MCP call with keyword arguments. |
+| `--jev-host-stdio` | An MCP-aware parent can exchange requests and responses with the benchmark over standard input and output. |
+| `CommandJev` | You have a local Jev command or a JSON-lines adapter. |
 
-## Metrics and cost
+`CommandJev` keeps a process open by default, with one JSON request and response
+per line. `CommandJev(..., persistent=False)` starts a process for each call.
+It detects `jev mcp` and uses MCP JSON-RPC over standard input and output. A
+local Jev command needs its own provider authentication.
 
-Set `NARU_AGENT_METRICS=1` with a direct `run_naru` caller to append redacted
-context decisions to `NARU_METRICS`. Naru records no prompt, state body,
-credential, or tool-result payload.
+### Use an MCP-aware parent
 
-Benchmark rows also keep provider-native usage beside normalized input, cache,
-output, retry, latency, task-success, and cost fields. The report shows Jev
-wall latency, provider latency, transport overhead, and one-time adapter
-startup apart from the main model. Jev decisions do not go through a
-text-generating LLM. The report keeps Jev cache reads and writes when the
-adapter reports them.
-
-The built-in `typesafe-jev-input-0.042-free-output` profile records a Jev price
-of $0.042 per million input tokens and free output. Cache prices are unknown.
-The comparator defers if nonzero cache usage appears without rates.
-
-For general execution observability, keep those events outside the recallable
-Event Log. You can feed the dependency-free JSONL to the
-[OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) and view it
-in a self-hosted [Phoenix](https://github.com/Arize-ai/phoenix),
-[Langfuse](https://langfuse.com/docs), or
-[OpenLIT](https://github.com/openlit/openlit) deployment. Naru does not add a
-vendor SDK.
-
-## Paired context proof
-
-Run the same split, question count, model, judge, budget, and turn limit once
-with each policy. The comparator pairs rows by question ID, excludes errored
-pairs from McNemar's test, and applies explicit task-success, failure,
-latency, and cost guardrails. It never prints answers, gold text, prompts, or
-raw task IDs.
+Launch this through a parent that can handle the protocol:
 
 ```bash
-python3 bench.py --tag naru-deterministic --arms naru \
+python3 bench.py --backend codex \
+  --arms naru --context-policy jev --jev-host-stdio --split oracle -n 12
+```
+
+The benchmark emits `NARU_JEV_REQUEST` records and expects one JSON MCP result
+on standard input for each record. The parent owns the MCP key. Model jobs run
+in a thread pool; only the shared Jev exchange is serialized. If the parent
+does not respond, the call times out and Naru uses deterministic selection.
+This mode requires that parent; a terminal alone does not supply the results.
+
+## Inspect metrics and cost
+
+For a direct `run_naru` caller, set `NARU_AGENT_METRICS=1` to append redacted
+context decisions to the file named by `NARU_METRICS`. These decision events
+exclude prompts, state bodies, credentials, and tool-result payloads.
+
+Benchmark rows keep provider-native usage with normalized input, cache,
+output, retries, latency, success, and cost fields. Reports separate Jev wall
+latency, provider latency, transport overhead, and adapter startup from the
+main model. Jev decisions do not use a text-generating LLM. Cache reads and
+writes remain visible when the adapter reports them.
+
+The repository's `typesafe-jev-input-0.042-free-output` pricing profile stores
+**$0.042 per million input tokens** and **free output**. It has no cache prices.
+Treat this as a named input to the experiment, not a guarantee of current
+provider pricing. The comparator defers if it sees nonzero cache usage without
+corresponding rates.
+
+Keep general execution metrics outside the searchable memory log. You can
+export the JSONL through an
+[OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) to a
+self-hosted [Phoenix](https://github.com/Arize-ai/phoenix),
+[Langfuse](https://langfuse.com/docs), or
+[OpenLIT](https://github.com/openlit/openlit) deployment. Naru does not bundle
+a vendor SDK or those services.
+
+## Compare policies
+
+Compare the `naru` arm with itself. Hold the split, questions, backend, model,
+judge, budget, and turn limit fixed. Replace `MODEL_ID` and `JUDGE_ID` in both
+commands with supported IDs before running them:
+
+```bash
+python3 bench.py --backend codex \
+  --model MODEL_ID --judge-model JUDGE_ID \
+  --tag naru-deterministic --arms naru \
   --context-policy deterministic --split oracle -n 12
-NARU_JEV='jev mcp' python3 bench.py --tag naru-jev --arms naru \
+
+NARU_JEV='jev mcp' python3 bench.py --backend codex \
+  --model MODEL_ID --judge-model JUDGE_ID \
+  --tag naru-jev --arms naru \
   --context-policy jev --split oracle -n 12
+
 python3 experiment.py \
   --baseline results/naru-deterministic_oracle_n12.json \
   --candidate results/naru-jev_oracle_n12.json \
   --jev-pricing-profile typesafe-jev-input-0.042-free-output
 ```
 
-The default decision is `defer` when provider costs or Jev pricing are not
-measured. The built-in profile covers Jev's input and output rates. Supply
-cache rates too when Jev reports nonzero cache categories. Rates carry a
-version and are never hidden assumptions. Use `experiment.py --json` for a
-machine-readable, privacy-safe report.
+The comparator pairs rows by question ID and excludes errored pairs from
+McNemar's test. It also checks task success, failures, latency, and cost against
+explicit limits. Its report excludes answers, gold text, prompts, and raw
+task IDs. Add `--json` for a machine-readable report.
+
+The result is `defer` when required provider costs or Jev prices are unknown.
+The named profile supplies Jev input and output rates; supply verified cache
+rates if cache usage is nonzero. Rates carry a version. Run
+`python3 experiment.py --help` for price and comparison-limit options.
