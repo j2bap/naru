@@ -1,0 +1,45 @@
+name: checks
+
+on: [push, pull_request]
+
+jobs:
+  selfchecks:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The README claims 3.9+. The oldest and the newest prove it.
+        # macOS is not decoration: it refuses RLIMIT_AS, so the "a refused
+        # limit reports itself refused" branch and the mutation that guards it
+        # only ever execute there. Ubuntu-only, that check ran nowhere.
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Keep private development files out of releases
+        shell: bash
+        run: |
+          private_paths=$(git ls-files -- AGENTS.md CLAUDE.md .agents .audit docs/adr docs/naru-persistent-state-report.html)
+          if [ -n "$private_paths" ]; then
+            printf 'Private development files are tracked:\n%s\n' "$private_paths"
+            exit 1
+          fi
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: FTS5 is a hard requirement, not a nice-to-have
+        run: python -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"
+      - run: python ms.py
+      - run: python kernel.py
+      - run: python eviction.py
+      - run: python agent.py
+      - run: python naru.py --selfcheck
+      - run: python hook_spill.py --selfcheck
+      - run: python noise.py --selfcheck
+      - run: python metrics.py --selfcheck
+      - run: python backend.py --selfcheck
+      - run: python bench.py --selfcheck
+      - run: python beam.py --selfcheck
+      - run: python regrade.py --selfcheck
+      - run: python curation_probe.py --selfcheck
+      - run: python test_mutations.py

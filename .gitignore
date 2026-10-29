@@ -1,0 +1,22 @@
+data/
+results/*
+!results/published/
+__pycache__/
+.ruff_cache/
+blobs/
+*.db
+
+# Local development and research artifacts.
+/.audit/
+/.agents/
+/AGENTS.md
+/CLAUDE.md
+/docs/naru-persistent-state-report.html
+docs/papers/
+
+# Local git worktrees.
+.worktrees/
+
+# Private design records
+/docs/adr/
+/.agents/adr/
