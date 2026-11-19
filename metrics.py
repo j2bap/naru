@@ -57,6 +57,10 @@ def read(days=None):
             d = json.loads(raw)
         except ValueError:
             continue
+        # Every reader indexes `e`. One line that is JSON but not an event,
+        # such as a bare `42`, used to crash `naru stats` for the whole file.
+        if not isinstance(d, dict) or not isinstance(d.get("e"), str):
+            continue
         if cutoff and d.get("t", "") < cutoff:
             continue
         out.append(d)
@@ -66,6 +70,16 @@ def read(days=None):
 def record_show(store_id, run_id, lo, hi):
     """Record one printed span with the store and run that own it."""
     record("show", v=2, store=store_id, run=run_id, lo=lo, hi=hi)
+
+
+def record_show_part(store_id, run_id, seq):
+    """Record one printed slice of a row too large for a single show.
+
+    Not a `show` receipt: a slice does not prove the whole row was read, so
+    `opened()` must not see it (ADR 0010). It exists so a spill above the show
+    limit, which can only ever be read in slices, can still count as reopened.
+    """
+    record("show_part", store=store_id, run=run_id, seq=seq)
 
 
 def record_agent_context(run_id, turn, decision, model="custom"):
@@ -82,6 +96,7 @@ def record_agent_context(run_id, turn, decision, model="custom"):
         "considered_tokens",
         "selected_tokens",
         "dropped_tokens",
+        "over_budget_tokens",
         "selected_blocks",
         "omitted_blocks",
         "jev_invoked",
@@ -122,7 +137,13 @@ def _pct(vals, p):
 
 
 def _reopened_spills(events):
-    """Return distinct attributable spills opened by a later show receipt."""
+    """Return distinct attributable spills that a show printed.
+
+    A receipt records the span that was asked for, and `show --run B` prints
+    only run B's rows inside it. So a receipt reopens a spill only when it
+    names the spill's run, or no run at all, which prints every row in the
+    span. A slice of one large row counts the same way.
+    """
     shows = [
         e
         for e in events
@@ -132,6 +153,11 @@ def _reopened_spills(events):
         and type(e.get("lo")) is int
         and type(e.get("hi")) is int
     ]
+    parts = {
+        (e.get("store"), e.get("seq"), e.get("run"))
+        for e in events
+        if e.get("e") == "show_part"
+    }
     spills = [e for e in events if e.get("e") == "hook" and e.get("spilled")]
     attributable = [
         e
@@ -144,8 +170,14 @@ def _reopened_spills(events):
         if any(
             shown["store"] == spill["store"]
             and shown["lo"] <= spill["seq"] <= shown["hi"]
+            and shown.get("run") in (None, spill.get("run"))
             for shown in shows
         )
+        or parts
+        & {
+            (spill["store"], spill["seq"], spill.get("run")),
+            (spill["store"], spill["seq"], None),
+        }
     }
     return len(reopened), len(attributable), len(spills) - len(attributable)
 
@@ -293,6 +325,10 @@ def demo():
         },
     )
     record("error", msg="disk full")
+    # Lines that are JSON but not events. Every reader gets them from read(),
+    # so read() must drop them.
+    with PATH.open("a") as fh:
+        fh.write('42\n[1]\n{"t":"2026-01-01T00:00:00"}\n{"e":7}\n')
 
     ev = read()
     assert len(ev) == 12, ev
@@ -320,6 +356,28 @@ def demo():
     assert "consider lowering" in out, out
     assert "Bash=1/3" in out and "X=1/1" in out, out
     assert "claude-code=1/3" in out and "legacy=1/1" in out, out
+
+    # A receipt for another run spans the spill's seq without having printed
+    # it. Only the spill's own run, or a show with no run, reopens it.
+    def reopened(*events):
+        spill = {"e": "hook", "spilled": True, "store": "s", "run": "a", "seq": 5}
+        return _reopened_spills([spill, *events])[0]
+
+    def receipt(run):
+        return {"e": "show", "v": 2, "store": "s", "run": run, "lo": 1, "hi": 9}
+
+    assert reopened(receipt("b")) == 0, "another run's receipt reopened a spill"
+    assert reopened(receipt("a")) == 1 and reopened(receipt(None)) == 1
+    # A spill above the show limit is read in slices, which write no receipt.
+    # The slice event reopens it, and still authorizes no claim.
+    PATH.write_text("")
+    record_show_part("s", "a", 5)
+    assert reopened(*read()) == 1, read()
+    assert not opened("s", "a", 5, 5), "a slice authorized a claim"
+    for other in (("t", "a", 5), ("s", "b", 5), ("s", "a", 6)):
+        PATH.write_text("")
+        record_show_part(*other)
+        assert reopened(*read()) == 0, other
 
     # never raises, even with an unwritable path
     PATH = pathlib.Path("/nonexistent-dir-xyz/m.jsonl")

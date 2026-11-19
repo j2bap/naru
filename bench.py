@@ -47,7 +47,7 @@ from eviction import est, rollup
 from jev import CommandJev, host_stdio_evaluator
 from ms import MemorySurface
 
-# One owner for the paired-test p-value. noise.py defines it and
+# One owner for the p-value ADR 0006 publishes. noise.py had it first and
 # imports nothing local, so the dependency runs this way round.
 from noise import mcnemar
 
@@ -85,6 +85,20 @@ def backend_label(cmd):
     command means the provider resolver chose automatically.
     """
     return (shlex.split(cmd) or ["auto"])[0] if cmd else "auto"
+
+
+def backend_provenance(kind, command, prefix=""):
+    """Config fields that name the provider behind one role.
+
+    One owner, because regrade.py replaces the judge and must restamp the same
+    three fields. The command is reduced to its label and a one-way
+    fingerprint: its arguments can carry credentials.
+    """
+    return {
+        f"{prefix}resolved_backend": kind,
+        f"{prefix}backend": backend_label(command or kind),
+        f"{prefix}backend_fingerprint": backend_fingerprint(kind, command),
+    }
 
 
 def telemetry_id(value):
@@ -351,7 +365,8 @@ def judge(q, response, backend, votes=3):
         f"Question: {q['question']}\n\nGold answer: {q['answer']}\n\n"
         f"Candidate answer: {candidate}\n\nVerdict:"
     )
-    yes = no = 0
+    counted = backend.usage.errors
+    yes = no = lost = 0
     for i in range(votes):
         v = (
             backend(p, system=JUDGE_SYSTEM, nudge="(Reply with exactly one word.)")
@@ -363,10 +378,22 @@ def judge(q, response, backend, votes=3):
         elif v == "WRONG":
             no += 1
         else:
-            backend.usage.errors += 1
+            lost += 1
         # early exit once the outcome cannot change
         if yes > votes // 2 or no > votes // 2:
             break
+    if lost:
+        # The backend counts a vote whose retries ran out and never sees a
+        # malformed verdict, so adding one here as well counted the first kind
+        # twice. Set the count from `lost` instead: each lost vote is one.
+        if yes > votes // 2 or no > votes // 2:
+            # The other votes still reached a majority, so the verdict stands.
+            # That is a failure the vote recovered from, and it must not drop
+            # a graded row from the pairing. It stays visible as a retry.
+            backend.usage.errors = counted
+            backend.usage.call_retries += lost
+        else:
+            backend.usage.errors = counted + lost
     return yes > (votes // 2)
 
 
@@ -561,15 +588,19 @@ def build_prompt(
     return _question_prompt(q, body)
 
 
-def _result_status(be, judge_usage, error, judge_failure, correct=False):
-    """Return task status fields without treating harness errors as misses."""
-    errors = be.usage.errors + int(error is not None and not judge_failure)
+def _result_status(model_errors, judge_usage, error, judge_failure, correct=False):
+    """Return task status fields without treating harness errors as misses.
+
+    Takes the answerer's error count, not its backend, so regrade.py can
+    restate a saved row with the same rules.
+    """
+    errors = model_errors + int(error is not None and not judge_failure)
     judge_errors = (judge_usage.errors if judge_usage else 0) + int(
         error is not None and judge_failure
     )
     if error is not None:
         failure_class = "judge" if judge_failure else "harness"
-    elif be.usage.errors:
+    elif model_errors:
         failure_class = "model"
     elif judge_usage is not None and judge_usage.errors:
         failure_class = "judge"
@@ -671,9 +702,16 @@ def one(
     context_policy="deterministic",
     jev_command=None,
     jev_evaluator=None,
+    backend=None,
+    backend_command=None,
 ):
-    """Run a single question through one arm. Returns a result record."""
-    be = get_backend(model)
+    """Run a single question through one arm. Returns a result record.
+
+    `backend` and `backend_command` are the provider main() resolved. A worker
+    that resolved NARU_BACKEND again could build a different adapter: a
+    command named `codex` reads back as the Codex CLI.
+    """
+    be = get_backend(model, backend=backend, command=backend_command)
     t0 = time.time()
     context_stats = {
         "context_policy": context_policy if arm == "naru" else "not_applicable"
@@ -709,16 +747,20 @@ def one(
         model_cost = (
             round(be.usage.cost_usd, 4) if be.usage.cost_measured else None
         )
-        judge_cost = (
-            round(judge_usage.cost_usd, 4)
-            if judge_usage is not None and judge_usage.cost_measured
-            else None
-        )
+        # A judge that never ran cost exactly 0. None is for a judge that ran
+        # and could not report its cost; using it for both made report() call
+        # this row unmeasurable while `task_cost_usd` below gave a number.
+        if judge_usage is None:
+            judge_cost = 0.0
+        elif judge_usage.cost_measured:
+            judge_cost = round(judge_usage.cost_usd, 4)
+        else:
+            judge_cost = None
         cost_measured = be.usage.cost_measured and (
             judge_usage is None or judge_usage.cost_measured
         )
         status = _result_status(
-            be, judge_usage, error, judge_failure, correct=correct
+            be.usage.errors, judge_usage, error, judge_failure, correct=correct
         )
         row = {
             "task_id": telemetry_id(q["question_id"]),
@@ -833,7 +875,7 @@ def one(
 
     candidate = (ans or "").strip()[:2000]
     try:
-        jb = get_backend(judge_model)
+        jb = get_backend(judge_model, backend=backend, command=backend_command)
         ok = judge(q, candidate, jb)
     except Exception as error:
         return result(
@@ -874,13 +916,16 @@ def report(rows, label, floor, measured=True):
     # printed: the gap between them is the flakiness tax.
     ok_rows = [r for r in rows if not r.get("errors") and not r.get("judge_errors")]
     lost = n - len(ok_rows)
-    bi = sum(r["billed_input"] for r in rows)
+    # A crashed worker's tokens are unknown (None). The totals cover the rows
+    # that reported; `lost` above already counts the row that did not.
+    counted = [r for r in rows if r["billed_input"] is not None]
+    bi = sum(r["billed_input"] for r in counted)
     # floor is None when the backend reports no usage at all. Subtracting 0 and
     # printing the result would present "not measured" as a measurement.
     net = (
         None
         if floor is None
-        else sum(max(0, r["billed_input"] - floor * r["turns"]) for r in rows)
+        else sum(max(0, r["billed_input"] - floor * r["turns"]) for r in counted)
     )
     cost_measured = all(
         isinstance(r.get("cost"), (int, float))
@@ -932,7 +977,7 @@ def report(rows, label, floor, measured=True):
         r.get("peak_prompt_tokens_estimated", r["peak_view_tokens"]) for r in rows
     ) / n
     print(
-        f"           out {sum(r['output'] for r in rows) / n:>7,.0f}/q   "
+        f"           out {sum(r['output'] for r in counted) / n:>7,.0f}/q   "
         f"turns {sum(r['turns'] for r in rows) / n:>4.1f}   calls {calls:>4.1f}   "
         + (
             f"${cost:.2f} total"
@@ -953,7 +998,7 @@ def report(rows, label, floor, measured=True):
         # The arm's own dollars, and the cache share that makes a token ratio
         # and a money ratio disagree. Both are published columns; printing
         # only a combined total left them hand-computed and unreproducible.
-        cr = sum(r.get("cache_read", 0) for r in rows)
+        cr = sum(r.get("cache_read") or 0 for r in rows)
         print(
             f"           model ${model_cost / n:.4f}/q   "
             f"judge ${judge_cost / n:.4f}/q   "
@@ -1010,7 +1055,7 @@ def report(rows, label, floor, measured=True):
     cretries = sum(r.get("call_retries", 0) for r in rows)
     # Rows written before judge_errors existed have no such key. Summing them
     # to 0 would print "0 judge errors" for a run where nobody counted, which
-    # would render an unavailable measurement as a measured value.
+    # is ADR 0002's mistake in miniature: not measured rendered as measured.
     jerrs = (
         sum(r["judge_errors"] for r in rows)
         if all("judge_errors" in r for r in rows)
@@ -1183,7 +1228,7 @@ def main():
     ap.add_argument(
         "--no-index",
         action="store_true",
-        help="ablate the ingestion-time eviction index (the paper)",
+        help="ablate the ingestion-time eviction index (AGENTS.md, ADR 0003)",
     )
     ap.add_argument(
         "--context-policy",
@@ -1213,9 +1258,9 @@ def main():
         )
     except (ValueError, FileNotFoundError) as error:
         sys.exit(str(error))
-    # Workers inherit one resolved provider. Keep the environment bridge for
-    # existing callers, while the resolver gives the CLI a general boundary.
-    os.environ["NARU_BACKEND"] = backend_command or backend_kind
+    # Every backend below is built from this pair. Writing it back to
+    # NARU_BACKEND for workers to resolve again lost the kind: the command
+    # `codex` came back as the Codex adapter.
     a.model = a.model or default_model_for_backend(backend_kind)
     a.judge_model = a.judge_model or a.model
     if a.jev_host_stdio:
@@ -1273,13 +1318,17 @@ def main():
         except (ValueError, FileNotFoundError) as e:
             sys.exit(str(e))
 
-    probe_backend = get_backend(a.model)
+    probe_backend = get_backend(
+        a.model, backend=backend_kind, command=backend_command
+    )
     try:
         measured = probe_backend.reports_tokens
     finally:
         probe_backend.close()
     if a.harness_floor is None:
-        a.harness_floor = measure_floor(a.model)
+        a.harness_floor = measure_floor(
+            a.model, backend=backend_kind, command=backend_command
+        )
         if a.harness_floor is None:
             print(
                 "harness floor NOT measurable with this backend — token columns "
@@ -1331,6 +1380,8 @@ def main():
                     and a.context_policy in ("shadow", "jev")
                     else None
                 ),
+                backend=backend_kind,
+                backend_command=backend_command,
             ): (q, arm)
             for q, arm in jobs
         }
@@ -1347,9 +1398,9 @@ def main():
                     "qid": q["question_id"],
                     "type": q["question_type"],
                     "arm": arm,
-                    "backend": backend_label(os.environ.get("NARU_BACKEND")),
+                    "backend": backend_label(backend_command or backend_kind),
                     "judge_backend": backend_label(
-                        os.environ.get("NARU_BACKEND")
+                        backend_command or backend_kind
                     ),
                     "correct": False,
                     "gold": q["answer"],
@@ -1359,14 +1410,18 @@ def main():
                     "prompt_tokens_estimated": 0,
                     "peak_prompt_tokens_estimated": 0,
                     "backend_calls": 0,
-                    "seconds": 0,
-                    "billed_input": 0,
-                    "fresh_input": 0,
-                    "cache_creation": 0,
-                    "cache_read": 0,
-                    "output": 0,
-                    "cost": 0,
-                    "judge_cost": 0,
+                    # The worker died with its counters. Time and cost are
+                    # unknown, and a 0 here read as a free, instant question.
+                    "seconds": None,
+                    # Unknown, like time and cost. A 0 here read as a
+                    # question that used no tokens.
+                    "billed_input": None,
+                    "fresh_input": None,
+                    "cache_creation": None,
+                    "cache_read": None,
+                    "output": None,
+                    "cost": None,
+                    "judge_cost": None,
                     "errors": 1,
                     "judge_errors": 0,
                     "call_retries": 0,
@@ -1396,11 +1451,11 @@ def main():
                     "tool_result_tokens": 0,
                     "model_switch": False,
                     "subagent_call_count": 0,
-                    "latency_ms": 0,
+                    "latency_ms": None,
                     "task_success": False,
                     "failure_class": "harness",
                     "pricing_version": os.environ.get("NARU_PRICING_VERSION") or None,
-                    "task_cost_usd": 0,
+                    "task_cost_usd": None,
                     "cost_includes_jev": True,
                     "provider_usage": {},
                     "judge_provider_usage": {},
@@ -1438,16 +1493,8 @@ def main():
     # answered, and keep it separate from the model name for auditability.
     cfg = dict(vars(a))
     cfg["result_format"] = RESULT_FORMAT
-    cfg["resolved_backend"] = backend_kind
-    cfg["backend"] = backend_label(os.environ.get("NARU_BACKEND"))
-    cfg["backend_fingerprint"] = backend_fingerprint(
-        backend_kind, backend_command
-    )
-    cfg["judge_resolved_backend"] = backend_kind
-    cfg["judge_backend"] = backend_label(os.environ.get("NARU_BACKEND"))
-    cfg["judge_backend_fingerprint"] = backend_fingerprint(
-        backend_kind, backend_command
-    )
+    cfg.update(backend_provenance(backend_kind, backend_command))
+    cfg.update(backend_provenance(backend_kind, backend_command, "judge_"))
     # Command arguments can carry credentials. Keep only the safe executable
     # label in result metadata and the one-way fingerprint above.
     cfg["backend_command"] = (
@@ -1500,6 +1547,33 @@ def demo():
     assert malformed.usage.errors == 1
     exact = VerdictBackend(" correct \n")
     assert judge(judge_q, "a", exact, votes=1)
+
+    # A lost vote is one error, whichever layer noticed it: the backend counts
+    # a vote whose retries ran out, the judge a malformed verdict. When the
+    # other votes still reach a majority the verdict stands and the lost vote
+    # is a retry, not an error.
+    from backend import _Retrying
+
+    class Votes(_Retrying):
+        """A real retry loop over scripted verdicts. "" is a lost vote."""
+
+        def __init__(self, *script):
+            super().__init__(retries=1)
+            self.script = list(script)
+
+        def _once(self, prompt, system=None):
+            return self.script.pop(0)
+
+    all_lost = Votes("", "", "")
+    assert not judge(judge_q, "a", all_lost)
+    assert all_lost.usage.errors == 3, all_lost.usage.errors
+    split = Votes("CORRECT", "CORRECTED", "WRONG")
+    assert not judge(judge_q, "a", split)
+    assert split.usage.errors == 1, "no majority must stay a judge error"
+    recovered = Votes("CORRECT", "", "CORRECT")
+    assert judge(judge_q, "a", recovered)
+    assert recovered.usage.errors == 0, recovered.usage.errors
+    assert recovered.usage.call_retries == 1, recovered.usage.call_retries
 
     # rag_context returns hits in LOG order, not BM25 rank order. The last row
     # repeats the term most, so BM25 ranks it first and the sort must move it
@@ -1693,6 +1767,105 @@ def demo():
     assert failed_judge["billed_input"] == 7
     assert failed_judge["backend_calls"] == 1
     assert failed_judge["errors"] == 0 and failed_judge["judge_errors"] == 1
+    # The same recovered vote, seen from the row: graded, successful, and kept
+    # in the pairing, with the lost vote in the judge's retry count.
+    with patch.object(
+        sys.modules[__name__], "get_backend",
+        side_effect=[KnownUsageBackend(), Votes("CORRECT", "CORRECTED", "CORRECT")],
+    ):
+        graded = one(synth, "full", HAIKU, HAIKU, 1, 6000, False)
+    assert graded["correct"] and graded["task_success"], graded
+    assert graded["judge_errors"] == 0 and graded["failure_class"] is None
+    assert graded["judge_usage_normalized"]["retry_count"] == 1
+
+    # A judge that never ran cost 0, so a harness error before the judge keeps
+    # a measured row: report() and `task_cost_usd` must give the same answer.
+    class BrokenBackend(KnownUsageBackend):
+        def __call__(self, prompt, system=None, nudge=None):
+            self.usage.cost_usd = 0.03
+            raise RuntimeError("harness broke")
+
+    with patch.object(
+        sys.modules[__name__], "get_backend", side_effect=[BrokenBackend()]
+    ):
+        broken = one(synth, "full", HAIKU, HAIKU, 1, 6000, False)
+    assert broken["failure_class"] == "harness" and broken["judge_backend"] is None
+    assert broken["cost"] == 0.03 and broken["judge_cost"] == 0
+    assert broken["task_cost_usd"] == 0.03, broken["task_cost_usd"]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        report([broken], "full", 0)
+    assert "$0.03 total" in buf.getvalue(), buf.getvalue()
+
+    # The provider main() resolved is passed in, never resolved again from the
+    # environment. NARU_BACKEND names a command that does not exist, so a
+    # second resolution fails here instead of quietly answering.
+    os.environ["NARU_BACKEND"] = "definitely-not-a-real-backend"
+    try:
+        passed = one(
+            synth, "full", HAIKU, HAIKU, 1, 6000, False,
+            backend="command", backend_command="cat",
+        )
+    finally:
+        if old_backend is None:
+            os.environ.pop("NARU_BACKEND", None)
+        else:
+            os.environ["NARU_BACKEND"] = old_backend
+    assert passed["backend"] == "cat" and passed["judge_backend"] == "cat"
+
+    # main()'s side of the same rule, and the row it writes for a worker that
+    # died. `--backend-command codex` is the case that broke: read back from
+    # NARU_BACKEND it selects the Codex adapter. Every backend main() builds
+    # or hands to a worker must carry ("command", "codex") instead. The worker
+    # here always raises, so the row is main()'s fallback: its time and cost
+    # are unknown, and report() must say so rather than print them as zero.
+    built = []
+
+    def record(name, value=None):
+        def call(*args, backend=None, command=None, backend_command=None, **_):
+            built.append((name, backend, command or backend_command))
+            if value is RuntimeError:
+                raise RuntimeError("worker died")
+            return value
+        return call
+
+    class NoTokens:
+        reports_tokens = False
+
+        def close(self):
+            pass
+
+    me = sys.modules[__name__]
+    with tempfile.TemporaryDirectory() as run_root, patch.object(
+        sys, "argv",
+        ["bench.py", "--backend", "command", "--backend-command", "codex",
+         "--arms", "full", "--tag", "crash"],
+    ), patch.object(me, "get_backend", record("probe", NoTokens())), patch.object(
+        me, "measure_floor", record("floor")
+    ), patch.object(me, "one", record("worker", RuntimeError)), patch.object(
+        me, "load", lambda *args, **kwargs: [synth]
+    ), patch.object(me, "ProcessPoolExecutor", _ParentExecutor), patch.object(
+        me, "DATA", pathlib.Path(run_root) / "data"
+    ), patch.dict(os.environ):
+        os.environ.pop("NARU_BACKEND", None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main()
+        crashed = json.loads(
+            (pathlib.Path(run_root) / "results" / "crash_oracle_n1.json").read_text()
+        )
+    assert built == [
+        (name, "command", "codex") for name in ("probe", "floor", "worker")
+    ], built
+    assert crashed["config"]["resolved_backend"] == "command", crashed["config"]
+    assert crashed["config"]["judge_backend"] == "codex", crashed["config"]
+    crash_row = crashed["rows"][0]
+    assert crash_row["errors"] == 1 and crash_row["failure_class"] == "harness"
+    for unknown in ("cost", "judge_cost", "task_cost_usd", "latency_ms", "seconds",
+                    "billed_input", "fresh_input", "cache_creation", "cache_read",
+                    "output"):
+        assert crash_row[unknown] is None, (unknown, crash_row[unknown])
+    assert "cost not measurable" in buf.getvalue(), buf.getvalue()
     old_kernel = os.environ.get("NARU_KERNEL")
     old_tempdir = tempfile.tempdir
     with tempfile.TemporaryDirectory() as temp_root:

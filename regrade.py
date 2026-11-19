@@ -14,8 +14,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from backend import HAIKU, get_backend
-from bench import RESULT_FORMAT, judge, load
+from backend import HAIKU, get_backend, resolve_backend
+from bench import RESULT_FORMAT, _result_status, backend_provenance, judge, load
 
 
 def main(paths, model=HAIKU, workers=6):
@@ -47,19 +47,24 @@ def main(paths, model=HAIKU, workers=6):
             sys.exit(f"{path} has legacy 400-character answers; exact regrading is impossible")
         documents.append((path, data))
 
+    # Resolved once, for the same reason bench.py does it: every row gets the
+    # same judge, and the output can name the judge that produced the verdicts.
+    kind, command = resolve_backend(model=model)
+
     out_paths = []
     for p, d in documents:
         rows = d["rows"]
 
         def one(r):
-            be = get_backend(model)
+            be = get_backend(model, backend=kind, command=command)
             q = {"question": questions[r["qid"]], "answer": r["gold"]}
             new = judge(q, r.get("answer") or "", be)
-            return r, new, be.usage
+            return r, new, be
 
         changed, cost, cost_measured = 0, 0.0, True
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for r, new, usage in ex.map(one, rows):
+            for r, new, be in ex.map(one, rows):
+                usage = be.usage
                 if getattr(usage, "cost_measured", True):
                     cost += usage.cost_usd
                 else:
@@ -72,12 +77,23 @@ def main(paths, model=HAIKU, workers=6):
                     if getattr(usage, "cost_measured", True)
                     else None
                 )
-                r["judge_errors"] = usage.errors
                 r["judge_call_retries"] = usage.call_retries
                 r["judge_empty_retries"] = usage.empty_retries
-                r["task_success"] = bool(
-                    r["correct"] and not r.get("errors") and not usage.errors
+                # The answer is frozen, so its error count stands. Everything
+                # the original judge left on the row is replaced: a row that
+                # was a judge failure kept `failure_class` and `judge_error`
+                # beside the new verdict, and named a judge that did not
+                # produce it.
+                status = _result_status(
+                    r.get("errors") or 0, usage, None, False, correct=new
                 )
+                if r.get("failure_class") == "harness":
+                    # The count alone cannot tell a harness loss from a model
+                    # error, and regrading the judge changes neither.
+                    status["failure_class"] = "harness"
+                r.update(status)
+                r.pop("judge_error", None)
+                r["judge_backend"] = getattr(be, "label", model)
                 base_cost = r.get("cost", 0)
                 r["task_cost_usd"] = (
                     round(base_cost + r["judge_cost"], 4)
@@ -93,6 +109,7 @@ def main(paths, model=HAIKU, workers=6):
                     r["judge_usage_normalized"] = usage.normalized()
 
         d.setdefault("config", {})["judge_model"] = model
+        d["config"].update(backend_provenance(kind, command, "judge_"))
         d["config"]["result_format"] = RESULT_FORMAT
 
         outp = p.with_name(p.stem + "_regraded.json")
@@ -123,6 +140,8 @@ def demo():
         empty_retries = 0
 
     class Backend:
+        label = "new-judge"
+
         def __init__(self):
             self.usage = Usage()
 
@@ -130,35 +149,68 @@ def demo():
             return "CORRECT" if "TAIL FACT" in prompt else "WRONG"
 
     def questions(_):
-        return [{"question_id": "q1", "question": "where is the fact?"}]
+        return [
+            {"question_id": "q1", "question": "where is the fact?"},
+            {"question_id": "q2", "question": "what else?"},
+        ]
 
     import tempfile
     from unittest import mock
+
+    from backend import backend_fingerprint
+
+    # Arguments can carry a credential; only the label and a fingerprint of
+    # the regrade judge may reach the output.
+    new_judge = ("command", "new-judge --key sk-secret")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
         current = root / "current.json"
         answer = "x" * 450 + " TAIL FACT"
         current.write_text(json.dumps({
-            "config": {"result_format": RESULT_FORMAT},
+            "config": {
+                "result_format": RESULT_FORMAT, "judge_backend": "old-judge",
+                "judge_resolved_backend": "codex",
+                "judge_backend_fingerprint": "old",
+            },
             "rows": [{
                 "qid": "q1", "arm": "full", "gold": "TAIL FACT",
                 "answer": answer, "correct": False, "judge_errors": 9,
-                "judge_cost": 9.0,
+                "judge_cost": 9.0, "failure_class": "judge",
+                "judge_error": "HARNESS: judge unavailable",
+                "judge_backend": "old-judge",
+            }, {
+                "qid": "q2", "arm": "full", "gold": "another fact",
+                "answer": "HARNESS: worker died", "correct": False,
+                "errors": 1, "failure_class": "harness",
             }],
         }))
         with mock.patch(f"{__name__}.load", questions), mock.patch(
-            f"{__name__}.get_backend", lambda _: Backend()
+            f"{__name__}.resolve_backend", lambda model=None: new_judge
+        ), mock.patch(
+            f"{__name__}.get_backend", lambda *_args, **_kwargs: Backend()
         ):
             assert main([current], workers=1) == 0
-        result = json.loads((root / "current_regraded.json").read_text())
-        row = result["rows"][0]
+        text = (root / "current_regraded.json").read_text()
+        result = json.loads(text)
+        row, lost = result["rows"]
         assert row["correct"] and row["answer"] == answer
         assert row["judge_errors"] == 0 and row["judge_cost"] == 0.25
         assert row["task_success"]
         assert row["task_cost_usd"] == 0.25
-        assert result["config"]["result_format"] == RESULT_FORMAT
-        assert result["config"]["judge_model"] == HAIKU
+        # Nothing the original judge wrote may sit beside the new verdict.
+        assert row["failure_class"] is None and "judge_error" not in row, row
+        assert row["judge_backend"] == "new-judge", row["judge_backend"]
+        # The answer side is not regraded: a harness loss stays one.
+        assert lost["failure_class"] == "harness" and lost["errors"] == 1, lost
+        assert not lost["correct"] and not lost["task_success"]
+        config = result["config"]
+        assert config["result_format"] == RESULT_FORMAT
+        assert config["judge_model"] == HAIKU
+        assert config["judge_resolved_backend"] == "command", config
+        assert config["judge_backend"] == "new-judge", config
+        assert config["judge_backend_fingerprint"] == backend_fingerprint(*new_judge)
+        assert "sk-secret" not in text
 
         legacy = root / "legacy.json"
         legacy.write_text(json.dumps({
@@ -170,7 +222,8 @@ def demo():
         }))
         calls = []
         with mock.patch(f"{__name__}.load", questions), mock.patch(
-            f"{__name__}.get_backend", lambda _: calls.append(1) or Backend()
+            f"{__name__}.get_backend",
+            lambda *_args, **_kwargs: calls.append(1) or Backend(),
         ):
             try:
                 main([legacy], workers=1)

@@ -11,6 +11,7 @@ protocol. The bridge never logs prompt, state, or stderr content.
 
 import json
 import io
+import math
 import os
 import selectors
 import shlex
@@ -26,8 +27,16 @@ from dataclasses import dataclass, field
 MAX_RESPONSE_CHARS = 1_000_000
 
 
-def _numeric(value):
+def usage_number(value):
+    """Return a provider usage number, or 0 when it is not a usable count.
+
+    Usage is telemetry. Text, a boolean, a negative number, NaN, and infinity
+    are all recorded as 0, so a bad usage field can never fail the call that
+    carried a valid decision.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not 0 <= value < math.inf:
         return 0
     return value
 
@@ -62,13 +71,12 @@ class JevUsage:
         input_tokens = usage.get("input_tokens")
         if (
             isinstance(input_tokens, bool)
-            or not isinstance(input_tokens, (int, float))
-            or input_tokens < 0
+            or usage_number(input_tokens) != input_tokens
         ):
             self.tokens_measured = False
-        self.input_tokens += int(_numeric(usage.get("input_tokens", 0)))
+        self.input_tokens += int(usage_number(usage.get("input_tokens", 0)))
         self.cache_read_tokens += int(
-            _numeric(
+            usage_number(
                 usage.get(
                     "cache_read_tokens",
                     usage.get("cache_read_input_tokens", 0),
@@ -76,16 +84,16 @@ class JevUsage:
             )
         )
         self.cache_write_tokens += int(
-            _numeric(
+            usage_number(
                 usage.get(
                     "cache_write_tokens",
                     usage.get("cache_creation_input_tokens", 0),
                 )
             )
         )
-        self.output_tokens += int(_numeric(usage.get("output_tokens", 0)))
+        self.output_tokens += int(usage_number(usage.get("output_tokens", 0)))
         self.provider_latency_ms += float(
-            _numeric(
+            usage_number(
                 usage.get(
                     "provider_latency_ms",
                     usage.get("latency_ms", 0),
@@ -93,7 +101,7 @@ class JevUsage:
             )
         )
         self.latency_ms += float(
-            _numeric(usage.get("latency_ms", 0))
+            usage_number(usage.get("latency_ms", 0))
             if elapsed_ms is None
             else elapsed_ms
         )
@@ -127,6 +135,85 @@ class JevUsage:
             "transport": self.transport,
             "tokens_measured": self.tokens_measured,
         }
+
+
+class _LineReader:
+    """Read newline-terminated lines from a descriptor under a real deadline.
+
+    ``select`` followed by ``readline()`` on a buffered text stream is not
+    bounded. A peer that sends half a line holds the read until it finishes,
+    and a second line that arrived with the first sits in Python's buffer
+    where ``select`` cannot see it. This reader owns the only buffer and reads
+    the descriptor itself, so both cases follow the deadline.
+    """
+
+    def __init__(self, descriptor, prefix=""):
+        self._descriptor = descriptor
+        self._prefix = prefix
+        self._buffer = bytearray()
+        self._skip_line = False
+
+    def _ready(self, seconds):
+        selector = selectors.DefaultSelector()
+        try:
+            try:
+                selector.register(self._descriptor, selectors.EVENT_READ)
+            except (OSError, ValueError) as error:
+                raise JevError(self._prefix + "timeout_unsupported") from error
+            return bool(selector.select(max(0, seconds)))
+        finally:
+            selector.close()
+
+    def _read(self):
+        """Buffer the bytes that are ready. Return False at end of input."""
+        chunk = os.read(self._descriptor, 65536)
+        if not chunk:
+            return False
+        if self._skip_line:
+            _, newline, chunk = chunk.partition(b"\n")
+            self._skip_line = not newline
+        self._buffer += chunk
+        return True
+
+    def discard_pending(self):
+        """Drop everything the peer wrote before the next request is sent.
+
+        Those bytes answer an earlier request. If they end in the middle of a
+        line, the rest of that line is dropped when it arrives, so the tail of
+        a late answer cannot be read as the start of the next one.
+        """
+        while self._ready(0) and self._read():
+            pass
+        if self._buffer:
+            self._skip_line = not self._buffer.endswith(b"\n")
+            self._buffer.clear()
+
+    def readline(self, deadline):
+        """Return one line, or ``""`` at end of input.
+
+        ``deadline`` is a ``time.monotonic()`` value. Lines already in the
+        buffer are returned without waiting.
+        """
+        while True:
+            end = self._buffer.find(b"\n")
+            if end >= 0:
+                line = bytes(self._buffer[: end + 1])
+                del self._buffer[: end + 1]
+            elif len(self._buffer) > MAX_RESPONSE_CHARS:
+                raise JevError("response_too_large")
+            elif not self._ready(deadline - time.monotonic()):
+                raise JevError(self._prefix + "timeout")
+            elif self._read():
+                continue
+            else:
+                line = bytes(self._buffer)
+                self._buffer.clear()
+            if len(line) > MAX_RESPONSE_CHARS:
+                raise JevError("response_too_large")
+            try:
+                return line.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise JevError("invalid_utf8") from error
 
 
 def _decode(value):
@@ -249,6 +336,14 @@ def host_stdio_evaluator(
     and waits for one JSON-encoded MCP result on ``input_stream``. A host such
     as Codex can service that request with its native MCP binding. The Jev key
     never enters the benchmark process.
+
+    Each request carries a ``request_id`` number. A host may copy it unchanged
+    into the top level of its response line. A response with a different
+    ``request_id`` answers an earlier request that timed out, so it is skipped
+    and the wait continues until the deadline. A response without
+    ``request_id`` is accepted. On a pipe or terminal, lines that are already
+    waiting when a request is sent are dropped for the same reason: the host
+    must answer after it reads the request.
     """
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise ValueError("host Jev timeout must be positive")
@@ -256,49 +351,67 @@ def host_stdio_evaluator(
     output_stream = sys.stderr if output_stream is None else output_stream
     prefix = "NARU_JEV_REQUEST "
 
-    def read_response():
-        """Read one host line without waiting forever on an open pipe."""
+    def open_reader():
+        """Return a deadline reader for a pipe or terminal, else None."""
         try:
             descriptor = input_stream.fileno()
         except (AttributeError, io.UnsupportedOperation, ValueError):
             # In-memory streams used by library callers are already bounded by
             # their caller. Real stdin and pipes expose fileno below.
-            return input_stream.readline()
+            return None
         try:
             mode = os.fstat(descriptor).st_mode
         except OSError as error:
             raise JevError("host_timeout_unsupported") from error
         if stat.S_ISREG(mode):
-            return input_stream.readline()
-        selector = selectors.DefaultSelector()
-        try:
-            try:
-                selector.register(input_stream, selectors.EVENT_READ)
-            except (OSError, ValueError) as error:
-                raise JevError("host_timeout_unsupported") from error
-            if not selector.select(timeout):
-                raise JevError("host_timeout")
-        finally:
-            selector.close()
-        return input_stream.readline()
+            return None
+        return _LineReader(descriptor, "host_")
+
+    # The reader keeps bytes between calls, so it is opened once. DirectJev
+    # serializes evaluate(), which makes this state safe without a lock.
+    reader = unopened = object()
+    request_id = 0
 
     def evaluate(state, questions):
-        request = {"model": model, "state": state, "questions": questions}
+        nonlocal reader, request_id
+        if reader is unopened:
+            reader = open_reader()
+        request_id += 1
+        request = {
+            "request_id": request_id,
+            "model": model,
+            "state": state,
+            "questions": questions,
+        }
         try:
             encoded = json.dumps(request, separators=(",", ":"))
         except (TypeError, ValueError) as error:
             raise JevError("request_not_json") from error
+        if reader is not None:
+            reader.discard_pending()
         output_stream.write(f"\n{prefix}{encoded}\n")
         output_stream.flush()
-        response = read_response()
-        if not response:
-            raise JevError("host_response_eof")
-        if len(response) > MAX_RESPONSE_CHARS:
-            raise JevError("response_too_large")
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError as error:
-            raise JevError("invalid_host_json") from error
+        deadline = time.monotonic() + timeout
+        while True:
+            response = (
+                input_stream.readline()
+                if reader is None
+                else reader.readline(deadline)
+            )
+            if not response:
+                raise JevError("host_response_eof")
+            if len(response) > MAX_RESPONSE_CHARS:
+                raise JevError("response_too_large")
+            try:
+                decoded = json.loads(response)
+            except json.JSONDecodeError as error:
+                raise JevError("invalid_host_json") from error
+            if (
+                isinstance(decoded, dict)
+                and decoded.get("request_id", request_id) != request_id
+            ):
+                continue
+            return decoded
 
     return DirectJev(evaluate)
 
@@ -323,6 +436,7 @@ class CommandJev:
     protocol: str = "auto"
     argv: list = field(init=False, repr=False)
     _process: object = field(init=False, default=None, repr=False)
+    _reader: object = field(init=False, default=None, repr=False)
     _mcp_initialized: bool = field(init=False, default=False, repr=False)
     _request_id: int = field(init=False, default=0, repr=False)
 
@@ -373,11 +487,13 @@ class CommandJev:
         self.usage.starts += 1
         self.usage.startup_latency_ms += (time.monotonic() - started) * 1000
         self._process = process
+        self._reader = _LineReader(process.stdout.fileno())
         return process
 
     def _stop(self):
         process = self._process
         self._process = None
+        self._reader = None
         self._mcp_initialized = False
         if process is None:
             return
@@ -399,21 +515,10 @@ class CommandJev:
         """Stop a persistent adapter without exposing its stderr."""
         self._stop()
 
-    def _readline(self, process):
-        if process.stdout is None:
-            raise JevError("adapter_stdout_unavailable")
-        selector = selectors.DefaultSelector()
-        try:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            if not selector.select(self.timeout):
-                raise JevError("timeout")
-        finally:
-            selector.close()
-        line = process.stdout.readline()
+    def _readline(self, deadline):
+        line = self._reader.readline(deadline)
         if not line:
             raise JevError("adapter_eof")
-        if len(line) > MAX_RESPONSE_CHARS:
-            raise JevError("response_too_large")
         return line
 
     def _persistent_request(self, request):
@@ -421,6 +526,11 @@ class CommandJev:
         if process is None or process.poll() is not None:
             self._stop()
             process = self._start()
+        else:
+            # A line that is already waiting was written before this request,
+            # so it answers an earlier one. A new child has no earlier request
+            # and may answer before it reads, so its output is kept.
+            self._reader.discard_pending()
         if self.protocol == "mcp":
             if not self._mcp_initialized:
                 self._initialize_mcp(process)
@@ -429,15 +539,13 @@ class CommandJev:
             request, separators=(",", ":")
         )
         if process.stdin is None:
-            self._stop()
             raise JevError("adapter_stdin_unavailable")
         try:
             process.stdin.write(request + "\n")
             process.stdin.flush()
         except OSError as error:
-            self._stop()
             raise JevError("adapter_write_failed") from error
-        return self._readline(process)
+        return self._readline(time.monotonic() + self.timeout)
 
     def _next_request_id(self):
         self._request_id += 1
@@ -450,18 +558,20 @@ class CommandJev:
             process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
             process.stdin.flush()
         except (OSError, TypeError, ValueError) as error:
-            self._stop()
             raise JevError("adapter_write_failed") from error
 
-    def _read_mcp(self, process):
+    def _read_mcp(self, deadline):
         try:
-            return json.loads(self._readline(process))
+            return json.loads(self._readline(deadline))
         except json.JSONDecodeError as error:
             raise JevError("invalid_mcp_json") from error
 
-    def _rpc(self, process, request_id):
+    def _rpc(self, request_id):
+        # One deadline for the whole exchange. A timeout per line would let a
+        # server that keeps sending notifications hold the call forever.
+        deadline = time.monotonic() + self.timeout
         while True:
-            message = self._read_mcp(process)
+            message = self._read_mcp(deadline)
             if not isinstance(message, dict):
                 raise JevError("mcp_message_not_object")
             if message.get("id") != request_id:
@@ -491,7 +601,7 @@ class CommandJev:
                 },
             },
         )
-        result = self._rpc(process, request_id)
+        result = self._rpc(request_id)
         if not isinstance(result, dict):
             raise JevError("mcp_initialize_invalid")
         self._send_mcp(
@@ -515,7 +625,7 @@ class CommandJev:
                 },
             },
         )
-        return self._rpc(process, request_id)
+        return self._rpc(request_id)
 
     def _oneshot_request(self, request):
         try:
@@ -538,12 +648,13 @@ class CommandJev:
 
     def __call__(self, state, questions):
         payload = {"model": self.model, "state": state, "questions": questions}
+        # Count the attempt first, so errors can never exceed attempts.
+        self.usage.attempts += 1
         try:
             request = json.dumps(payload, separators=(",", ":"))
         except (TypeError, ValueError) as error:
             self.usage.errors += 1
             raise JevError("request_not_json") from error
-        self.usage.attempts += 1
         started = time.monotonic()
         try:
             raw = (
@@ -552,15 +663,16 @@ class CommandJev:
                 else self._oneshot_request(request)
             )
             response = _decode(raw)
-        except JevError:
+        except Exception as error:
+            # Every failure is handled here, whatever its type. An exception
+            # that escaped would leave the child alive mid-exchange, and its
+            # late answer would be read by the next call.
             self.usage.errors += 1
             self.usage.latency_ms += (time.monotonic() - started) * 1000
             if self.persistent:
                 self._stop()
-            raise
-        except (OSError, subprocess.TimeoutExpired) as error:
-            self.usage.errors += 1
-            self.usage.latency_ms += (time.monotonic() - started) * 1000
+            if isinstance(error, JevError):
+                raise
             raise JevError(type(error).__name__) from error
         elapsed_ms = (time.monotonic() - started) * 1000
         response = _with_wall_latency(response, elapsed_ms)
@@ -622,6 +734,48 @@ def demo():
     assert stream.usage.transport == "persistent"
     stream.close()
 
+    # An adapter that writes one line too many must not shift every later
+    # answer by one request.
+    extra_code = (
+        "import json,sys\n"
+        "response="
+        + repr(response)
+        + "\ncount=0\nfor line in sys.stdin:\n count+=1\n"
+        " out=json.dumps(dict(response, count=count))+'\\n'\n"
+        " sys.stdout.write(out+out); sys.stdout.flush()\n"
+    )
+    extra = CommandJev(shlex.join([sys.executable, "-u", "-c", extra_code]))
+    counts = [
+        extra({"goal": "g"}, {"source-index": {"type": "choice"}})["count"]
+        for _ in range(3)
+    ]
+    assert counts == [1, 2, 3], counts
+
+    # Any failure inside a persistent call is one counted error, a stopped
+    # child, and a JevError, whatever the exception type was.
+    child = extra._process
+
+    def broken(_request):
+        raise KeyError("not a transport error")
+
+    extra._persistent_request = broken
+    try:
+        extra({"goal": "g"}, {})
+    except JevError as error:
+        assert str(error) == "KeyError"
+    else:
+        raise AssertionError("an unexpected adapter failure was not reported")
+    assert extra.usage.errors == 1 and extra.usage.attempts == 4
+    assert extra._process is None and child.poll() is not None
+    try:
+        extra({"goal": object()}, {})
+    except JevError as error:
+        assert str(error) == "request_not_json"
+    else:
+        raise AssertionError("an unserializable request was accepted")
+    assert extra.usage.errors == 2 and extra.usage.attempts == 5
+    extra.close()
+
     mcp_code = (
         "import json,sys\n"
         "response="
@@ -648,6 +802,38 @@ def demo():
     assert mcp.usage.transport == "mcp-stdio"
     assert mcp.usage.startup_latency_ms >= 0
     mcp.close()
+
+    # The server sends notifications for longer than the timeout and then
+    # answers. One deadline covers the call, so the answer comes too late.
+    flood_code = (
+        "import json,sys,time\n"
+        "for line in sys.stdin:\n"
+        " message=json.loads(line)\n"
+        " if message.get('method') == 'initialize':\n"
+        "  print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':{}}),"
+        " flush=True)\n"
+        " elif message.get('method') == 'tools/call':\n"
+        "  end=time.time()+2.5\n"
+        "  while time.time() < end:\n"
+        "   print(json.dumps({'jsonrpc':'2.0','method':'notifications/progress'}),"
+        " flush=True)\n"
+        "   time.sleep(0.1)\n"
+        "  print(json.dumps({'jsonrpc':'2.0','id':message['id'],"
+        "'result':{'answers':{}}}), flush=True)\n"
+    )
+    flood = CommandJev(
+        shlex.join([sys.executable, "-u", "-c", flood_code]),
+        protocol="mcp",
+        timeout=1,
+    )
+    try:
+        flood({"goal": "g"}, {})
+    except JevError as error:
+        assert str(error) == "timeout"
+    else:
+        raise AssertionError("MCP notifications extended the call deadline")
+    assert flood.usage.errors == 1 and flood._process is None
+    flood.close()
 
     wrapped = {
         "content": [{"type": "text", "text": json.dumps(response)}],
@@ -688,6 +874,7 @@ def demo():
         if line.startswith("NARU_JEV_REQUEST ")
     )
     request = json.loads(request_line.removeprefix("NARU_JEV_REQUEST "))
+    assert request["request_id"] == 1
     assert request["model"] == "jev-latest"
     assert request["state"] == {"goal": "g"}
     assert request["questions"] == {"source-index": {"type": "choice"}}
@@ -708,9 +895,80 @@ def demo():
             assert str(error) == "host_timeout"
         else:
             raise AssertionError("a silent host pipe was allowed to block")
+        # The host answers the timed-out request late. The next request must
+        # not take that line as its own answer.
+        os.write(write_fd, (json.dumps(wrapped) + "\n").encode())
+        try:
+            silent({"goal": "g"}, {"source-index": {"type": "choice"}})
+        except JevError as error:
+            assert str(error) == "host_timeout"
+        else:
+            raise AssertionError("a late host answer was used for the next request")
     finally:
         silent_input.close()
         os.close(write_fd)
+
+    # A response that names another request is skipped, not returned.
+    stale = dict(response, request_id=7, stale=True)
+    current = dict(response, request_id=1)
+    matched = host_stdio_evaluator(
+        input_stream=StringIO(json.dumps(stale) + "\n" + json.dumps(current) + "\n"),
+        output_stream=StringIO(),
+    )({"goal": "g"}, {"source-index": {"type": "choice"}})
+    assert "stale" not in matched and matched["request_id"] == 1
+
+    read_fd, write_fd = os.pipe()
+    try:
+        reader = _LineReader(read_fd)
+        # Two lines in one chunk: the second is served from the buffer.
+        os.write(write_fd, b"one\ntwo\n")
+        assert reader.readline(time.monotonic() + 1) == "one\n"
+        assert reader.readline(time.monotonic()) == "two\n"
+        os.write(write_fd, b"\xff\n")
+        try:
+            reader.readline(time.monotonic() + 1)
+        except JevError as error:
+            assert str(error) == "invalid_utf8"
+        else:
+            raise AssertionError("invalid UTF-8 was returned as a line")
+
+        # A peer that sends a line slowly cannot hold the read past the
+        # deadline. The writer finishes by itself so a broken reader fails
+        # this check instead of hanging it.
+        def slow_line():
+            for _ in range(30):
+                os.write(write_fd, b"x")
+                time.sleep(0.01)
+            os.write(write_fd, b"\n")
+
+        writer = threading.Thread(target=slow_line)
+        writer.start()
+        try:
+            reader.readline(time.monotonic() + 0.05)
+        except JevError as error:
+            assert str(error) == "timeout"
+        else:
+            raise AssertionError("a partial line outlived the read deadline")
+        finally:
+            # The first half of the late line is discarded here. Its second
+            # half arrives afterwards and must be dropped with it.
+            reader.discard_pending()
+            writer.join()
+        os.write(write_fd, b"next\n")
+        assert reader.readline(time.monotonic() + 1) == "next\n"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert usage_number(7) == 7 and usage_number(2.5) == 2.5
+    assert all(
+        usage_number(value) == 0
+        for value in ("n/a", None, True, -1, float("inf"), float("nan"))
+    )
+    unusable = JevUsage()
+    unusable.record({"usage": {"input_tokens": float("inf"), "output_tokens": -2}})
+    assert unusable.input_tokens == 0 and unusable.output_tokens == 0
+    assert unusable.calls == 1 and not unusable.tokens_measured
 
     try:
         _decode({"isError": True, "content": [{"type": "text", "text": "secret"}]})

@@ -6,17 +6,13 @@ __pycache__/
 blobs/
 *.db
 
-# Local development and research artifacts.
-/.audit/
-/.agents/
-/AGENTS.md
-/CLAUDE.md
-/docs/naru-persistent-state-report.html
+# Per-question run artifacts: every row holds `gold` and `answer`.
+# Same rule as results/published/ — a public repo must not carry them.
+.audit/beam-quality-*.json
+.audit/beam-replay-*.json
+.audit/beam-terra-*.json
+.audit/beam-trace-*.json
 docs/papers/
 
 # Local git worktrees.
 .worktrees/
-
-# Private design records
-/docs/adr/
-/.agents/adr/

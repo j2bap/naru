@@ -14,6 +14,7 @@ import json
 from dataclasses import dataclass, replace
 
 from eviction import est
+from jev import usage_number
 
 CONTEXT_POLICIES = ("deterministic", "shadow", "jev")
 JEV_CHECKPOINTS = frozenset(("budget_pressure", "large_tool_result"))
@@ -72,7 +73,13 @@ class ContextBlock:
         }
 
     def clipped(self, max_tokens):
-        """Clip content while retaining a recovery handle when one exists."""
+        """Clip content while retaining a recovery handle when one exists.
+
+        The smallest result is one character of content plus the whole
+        handle. That floor is returned even when it is larger than
+        ``max_tokens``: a cut handle recovers nothing, so the caller reports
+        the excess instead.
+        """
         if max_tokens < 1:
             raise ValueError("a context block needs at least one token")
         if self.token_count <= max_tokens:
@@ -84,8 +91,6 @@ class ContextBlock:
         clipped = replace(self, content=content[:room].rstrip())
         while clipped.token_count > max_tokens and len(clipped.content) > 1:
             clipped = replace(clipped, content=clipped.content[:-1].rstrip())
-        if clipped.token_count > max_tokens:
-            raise ValueError("context block cannot fit its token budget")
         return clipped
 
 
@@ -111,6 +116,7 @@ class ContextSelection:
     fallback_reason: str = ""
     choices: tuple = ()
     all_block_ids: tuple = ()
+    over_budget_tokens: int = 0
 
     @property
     def text(self):
@@ -124,6 +130,7 @@ class ContextSelection:
             "considered_tokens": self.considered_tokens,
             "selected_tokens": self.selected_tokens,
             "dropped_tokens": self.dropped_tokens,
+            "over_budget_tokens": self.over_budget_tokens,
             "selected_blocks": [block.block_id for block in self.blocks],
             "omitted_blocks": [
                 block_id for block_id in self.all_block_ids if block_id not in selected
@@ -146,8 +153,31 @@ def _joined(items):
     return "\n\n".join(item.render() for item in items)
 
 
-def _fit(blocks, budget):
-    """Keep required blocks and add optional blocks by descending priority."""
+def _budgeted_tokens(blocks):
+    budgeted = [block for block in blocks if block.budgeted]
+    return est(_joined(budgeted)) if budgeted else 0
+
+
+def budget_pressure(blocks, budget):
+    """Return whether the budgeted blocks exceed the mutable budget.
+
+    This is the one definition of budget pressure. Unbudgeted blocks never
+    count: the fitter cannot drop them, so a caller that counted them would
+    name a checkpoint that this gate then skips.
+    """
+    return _budgeted_tokens(blocks) > budget
+
+
+def _fit(blocks, budget, promoted=frozenset()):
+    """Keep required blocks and add optional blocks by descending priority.
+
+    A required block is never dropped and its recovery handle is never cut.
+    When the smallest forms of the required blocks exceed the budget, the
+    result is over budget and the caller reports it; this function does not
+    raise for a small budget. ``promoted`` names blocks that are required only
+    because Jev said so. They are fitted after every other required block, so
+    an evaluator answer cannot take budget from a block the caller required.
+    """
     if budget < 1:
         raise ValueError("context budget must be positive")
     selected = [
@@ -156,7 +186,12 @@ def _fit(blocks, budget):
     required = [
         (i, block)
         for i, block in enumerate(blocks)
-        if block.budgeted and block.required
+        if block.budgeted and block.required and block.block_id not in promoted
+    ]
+    late = [
+        (i, block)
+        for i, block in enumerate(blocks)
+        if block.budgeted and block.required and block.block_id in promoted
     ]
     optional = [
         (i, block)
@@ -167,20 +202,23 @@ def _fit(blocks, budget):
     def budgeted_items(items):
         return [item for _, item in items if item.budgeted]
 
-    for position, block in required:
+    # Each required block leaves room for the smallest form of the required
+    # blocks after it. Without that reserve the first block takes the whole
+    # budget and a later block's recovery handle no longer fits.
+    floors = [block.clipped(1) for _, block in required]
+    for index, (position, block) in enumerate(required + late):
+        reserve = floors[index + 1:]
         candidate = block
         current = budgeted_items(selected)
-        if est(_joined(current + [candidate])) > budget:
-            remaining = max(1, budget - est(_joined(current)))
+        if est(_joined(current + [candidate] + reserve)) > budget:
+            remaining = max(1, budget - est(_joined(current + reserve)))
             candidate = block.clipped(remaining)
             while (
-                est(_joined(budgeted_items(selected) + [candidate])) > budget
+                est(_joined(current + [candidate] + reserve)) > budget
                 and remaining > 1
             ):
                 remaining -= 1
                 candidate = block.clipped(remaining)
-        if est(_joined(budgeted_items(selected) + [candidate])) > budget:
-            raise ValueError(f"required context block cannot fit: {block.block_id}")
         selected.append((position, candidate))
 
     for position, block in sorted(optional, key=lambda pair: (-pair[1].priority, pair[0])):
@@ -253,27 +291,30 @@ def _parse_jev(response, questions):
 
 
 def _usage(response):
+    """Read usage as telemetry: a bad number is 0 and never voids a decision."""
     usage = response.get("usage", {}) if isinstance(response, dict) else {}
     if not isinstance(usage, dict):
         return 0, 0, 0, 0, 0.0
     return (
-        int(usage.get("input_tokens", 0) or 0),
+        int(usage_number(usage.get("input_tokens", 0))),
         int(
-            usage.get(
-                "cache_read_tokens",
-                usage.get("cache_read_input_tokens", 0),
+            usage_number(
+                usage.get(
+                    "cache_read_tokens",
+                    usage.get("cache_read_input_tokens", 0),
+                )
             )
-            or 0
         ),
         int(
-            usage.get(
-                "cache_write_tokens",
-                usage.get("cache_creation_input_tokens", 0),
+            usage_number(
+                usage.get(
+                    "cache_write_tokens",
+                    usage.get("cache_creation_input_tokens", 0),
+                )
             )
-            or 0
         ),
-        int(usage.get("output_tokens", 0) or 0),
-        float(usage.get("latency_ms", 0) or 0),
+        int(usage_number(usage.get("output_tokens", 0))),
+        float(usage_number(usage.get("latency_ms", 0))),
     )
 
 
@@ -292,16 +333,24 @@ def select_context(
     reorder or omit optional blocks in ``jev`` mode; ``shadow`` records the
     same answer but applies the deterministic policy.  Any invalid response,
     evaluator exception, or missing evaluator uses the deterministic result.
+    So does an answer with no confident choice (``low_confidence``) and an
+    answer whose promoted blocks do not fit (``jev_fit_over_budget``).
+    ``jev_applied`` is true only when the delivered blocks come from Jev's
+    answer.
     """
     if mode not in CONTEXT_POLICIES:
         raise ValueError(f"unknown context policy: {mode}")
+    # A misspelt checkpoint would skip Jev on every turn with no reason.
+    if checkpoint != "turn" and checkpoint not in JEV_CHECKPOINTS:
+        raise ValueError(f"unknown context checkpoint: {checkpoint}")
     blocks = tuple(blocks)
     if len({block.block_id for block in blocks}) != len(blocks):
         raise ValueError("context block ids must be unique")
-    budgeted = [block for block in blocks if block.budgeted]
-    considered_tokens = est(_joined(budgeted)) if budgeted else 0
+    considered_tokens = _budgeted_tokens(blocks)
     questions = _question_map(blocks)
-    pressure = considered_tokens > budget or checkpoint == "large_tool_result"
+    pressure = (
+        budget_pressure(blocks, budget) or checkpoint == "large_tool_result"
+    )
     jev_request_tokens = _jev_request_tokens(goal, next_action, blocks, questions)
     should_invoke = (
         mode in ("shadow", "jev")
@@ -320,6 +369,7 @@ def select_context(
     jev_errors = 0
     fallback_reason = ""
     candidates = list(blocks)
+    promoted = set()
 
     if (
         mode in ("shadow", "jev")
@@ -364,6 +414,8 @@ def select_context(
                         if choice in ("omit", "no_match") and not block.required:
                             continue
                         boost = 100 if choice == "needed" else 10 if choice == "useful" else 0
+                        if choice == "needed" and not block.required:
+                            promoted.add(block.block_id)
                         block = replace(
                             block,
                             priority=block.priority + boost,
@@ -371,19 +423,34 @@ def select_context(
                         )
                     ranked.append((position, block))
                 candidates = [block for _, block in ranked]
-                jev_applied = True
         except Exception as error:
             jev_errors = 1
             fallback_reason = f"{type(error).__name__}"
 
-    selected = _fit(candidates, budget)
-    selected_budgeted = [block for block in selected if block.budgeted]
-    selected_tokens = est(_joined(selected_budgeted)) if selected_budgeted else 0
+    selected = None
+    if candidates != list(blocks):
+        selected = _fit(candidates, budget, promoted)
+        # A promoted block that cannot fit is clipped to its floor and puts
+        # the fit over budget. Jev may not break the budget, so its whole
+        # answer is set aside, not only the block that did not fit.
+        if _budgeted_tokens(selected) > budget:
+            selected = None
+            fallback_reason = "jev_fit_over_budget"
+        else:
+            jev_applied = True
+    elif mode == "jev" and jev_invoked and not jev_errors:
+        # Every confident choice changes the candidates, so an unchanged
+        # list means Jev answered and no answer reached the threshold.
+        fallback_reason = "low_confidence"
+    if selected is None:
+        selected = _fit(blocks, budget)
+    selected_tokens = _budgeted_tokens(selected)
     selection = ContextSelection(
         blocks=selected,
         considered_tokens=considered_tokens,
         selected_tokens=selected_tokens,
         dropped_tokens=max(0, considered_tokens - selected_tokens),
+        over_budget_tokens=max(0, selected_tokens - budget),
         policy=mode,
         checkpoint=checkpoint,
         jev_invoked=jev_invoked,
@@ -536,6 +603,11 @@ def demo():
     )
     assert "source" in [b.block_id for b in low.blocks]
     assert "filler" not in [b.block_id for b in low.blocks]
+    # Jev answered, but nothing it said was used. Telemetry must not count
+    # this decision as applied.
+    assert low.jev_invoked and not low.jev_applied
+    assert low.jev_confident_choices == 0
+    assert low.fallback_reason == "low_confidence"
 
     def needed(_state, questions):
         return {
@@ -558,6 +630,90 @@ def demo():
         checkpoint="budget_pressure",
     )
     assert "evidence" in [b.block_id for b in needed_selection.blocks]
+
+    # A promoted block takes only what the caller's required block leaves.
+    kept_whole = ContextBlock("req", "state", "r " * 100, required=True)
+    behind = select_context(
+        [ContextBlock("opt", "trace", "w " * 400), kept_whole],
+        60,
+        mode="jev",
+        evaluator=needed,
+        checkpoint="budget_pressure",
+    )
+    assert behind.jev_applied and kept_whole in behind.blocks, behind.blocks
+    assert "opt" in [b.block_id for b in behind.blocks]
+    assert behind.selected_tokens <= 60 and behind.over_budget_tokens == 0
+
+    # A promoted block that cannot fit must not crash the turn or break the
+    # budget: the whole answer is set aside for the deterministic selection.
+    tight = [
+        ContextBlock("source", "trace", "w " * 400, recovery=recovery),
+        ContextBlock("current", "state", "r " * 100, required=True),
+        ContextBlock("latest", "observation", "o " * 100, required=True),
+    ]
+    tight_plain = select_context(tight, 60, checkpoint="budget_pressure")
+    tight_jev = select_context(
+        tight, 60, mode="jev", evaluator=needed, checkpoint="budget_pressure"
+    )
+    assert tight_jev.blocks == tight_plain.blocks
+    assert tight_jev.selected_tokens <= 60
+    assert tight_jev.jev_invoked and not tight_jev.jev_applied
+    assert tight_jev.jev_confident_choices == 1
+    assert tight_jev.fallback_reason == "jev_fit_over_budget"
+
+    # Two required handles on a small budget: the first block gives up
+    # content so that the second handle still fits.
+    second = "ms.expand(950, session_id='run')"
+    handles = [
+        ContextBlock("current", "state", "r " * 100, required=True),
+        ContextBlock(
+            "latest", "observation", "o " * 100, required=True, recovery=second
+        ),
+    ]
+    both = select_context(handles, 55)
+    assert second in both.text and both.selected_tokens <= 55
+    assert both.over_budget_tokens == 0
+    # When the handles alone exceed the budget they still all survive, and
+    # the selection says by how much it is over.
+    handles[0] = replace(handles[0], recovery=recovery)
+    over = select_context(handles, 5)
+    assert recovery in over.text and second in over.text
+    assert over.selected_tokens > 5
+    assert over.over_budget_tokens == over.selected_tokens - 5
+    assert over.as_dict()["over_budget_tokens"] == over.over_budget_tokens
+
+    def bad_usage(_state, questions):
+        return {
+            "answers": {
+                key: {"type": "choice", "choice": "omit", "confidence": 0.95}
+                for key in questions
+            },
+            "usage": {
+                "input_tokens": "n/a",
+                "cache_read_tokens": -3,
+                "output_tokens": float("inf"),
+                "latency_ms": float("nan"),
+            },
+        }
+
+    usage_selection = select_context(
+        low_blocks, 30, mode="jev", evaluator=bad_usage, checkpoint="budget_pressure"
+    )
+    assert usage_selection.jev_applied and usage_selection.jev_errors == 0
+    assert "source" not in [b.block_id for b in usage_selection.blocks]
+    assert (
+        usage_selection.jev_input_tokens == 0
+        and usage_selection.jev_cache_read_tokens == 0
+        and usage_selection.jev_output_tokens == 0
+        and usage_selection.jev_latency_ms == 0.0
+    )
+
+    try:
+        select_context(blocks, 80, mode="jev", checkpoint="budget-pressure")
+    except ValueError as error:
+        assert "checkpoint" in str(error)
+    else:
+        raise AssertionError("an unknown checkpoint name was accepted")
 
     oversized = [
         ContextBlock(
@@ -596,6 +752,9 @@ def demo():
     )
     assert "trace" in [b.block_id for b in stable.blocks]
     assert stable.selected_tokens <= 10
+    # Pressure counts only what the fitter can drop.
+    assert not budget_pressure(stable.blocks, 10)
+    assert budget_pressure(blocks, 80) and not budget_pressure(blocks, 10_000)
 
     shadow = select_context(
         blocks,

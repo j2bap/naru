@@ -192,9 +192,16 @@ class _Retrying:
             self.usage.peak_prompt_tokens_estimated = max(
                 self.usage.peak_prompt_tokens_estimated, estimated
             )
+            reported = self.usage.calls
             out = self._once(p, system)
             if out is None:
-                self.usage.cost_measured = False
+                # Only an attempt that died before it reported usage spent an
+                # unknown amount. An is_error reply reports its own cost, and
+                # `Usage.add` already owns the reply that reports none.
+                # Marking every failed attempt unmeasured turned one recovered
+                # blip into a row with no cost at all.
+                if self.usage.calls == reported:
+                    self.usage.cost_measured = False
                 self.usage.call_retries += 1
                 continue
             if out.strip():
@@ -473,9 +480,9 @@ def resolve_backend(requested=None, command=None, model=None):
     ``NARU_BACKEND`` remains a compatibility override. Its named values select
     an adapter; any other value is treated as a generic stdin command. With no
     override, an explicit Claude model selects Claude, then ``auto`` prefers
-    an installed Codex CLI and then Claude. The choice is resolved once by the
-    parent benchmark process and inherited by workers, so a run cannot silently
-    mix providers.
+    an installed Codex CLI and then Claude. The benchmark resolves the choice
+    once in the parent process and passes the result to every backend it
+    builds, so a run cannot silently mix providers.
     """
     configured = (os.environ.get("NARU_BACKEND") or "").strip()
     choice = requested.strip() if isinstance(requested, str) else requested
@@ -557,7 +564,7 @@ def measure_floor(model=None, backend=None, command=None):
     Returns None when the floor could not be measured — a generic pipe that
     reports no usage at all, OR a probe call that failed. Never 0: a zero flows
     into the net-of-harness subtraction and prints as though a floor had been
-    measured, which would misreport a failed measurement as a measured zero.
+    measured, which is exactly the wrong number ADR 0002 exists to prevent.
     """
     b = get_backend(model, backend=backend, command=command)
     try:
@@ -568,7 +575,12 @@ def measure_floor(model=None, backend=None, command=None):
         # exit, unparseable JSON, a timeout, expired auth or a rate limit all
         # leave it at zero — and `// max(1, 0)` used to turn that into a
         # confident 0.
-        if not result or b.usage.errors or not b.usage.calls:
+        #
+        # `call_retries`: a failed attempt that the retry recovered from still
+        # went through `Usage.add`, usually with no input tokens. Averaging it
+        # in halved the floor, which is a wrong number that looks measured.
+        failed = b.usage.errors or b.usage.call_retries
+        if not result or failed or not b.usage.calls:
             return None
         return b.usage.billed_input // b.usage.calls
     finally:
@@ -772,6 +784,39 @@ def demo(live=True):
         assert measure_floor() is None
     finally:
         globals()["get_backend"] = real_get_backend
+
+    # An is_error reply reports its own cost, so a retry that recovers from it
+    # leaves the total measured. An attempt that died before reporting anything
+    # does not. The floor is stricter: one failed probe attempt gives None,
+    # because its empty usage would be averaged into the result.
+    class Scripted(Backend):
+        def _run(self, argv, prompt):
+            return self.replies.pop(0)
+
+        def _complain(self, msg):
+            pass
+
+    def scripted(*replies):
+        b = Scripted()
+        b.replies = list(replies)
+        return b
+
+    _error = json.dumps({"is_error": True, "usage": {}, "total_cost_usd": 0.01})
+    _good = json.dumps(
+        {"result": "ok", "usage": {"input_tokens": 1000}, "total_cost_usd": 0.02}
+    )
+    recovered = scripted(_error, _good)
+    assert recovered("q") == "ok" and recovered.usage.call_retries == 1
+    assert recovered.usage.cost_measured, "a reported cost became unmeasured"
+    assert round(recovered.usage.cost_usd, 4) == 0.03, recovered.usage.cost_usd
+    died = scripted(None, _good)
+    assert died("q") == "ok" and not died.usage.cost_measured
+    for replies, floor in (((_good,), 1000), ((_error, _good), None)):
+        globals()["get_backend"] = lambda *_a, **_k: scripted(*replies)
+        try:
+            assert measure_floor() == floor, (replies, measure_floor())
+        finally:
+            globals()["get_backend"] = real_get_backend
 
     # The "no usage" warning is per command, not per construction. bench.py
     # builds one backend per question per arm, so this is the difference

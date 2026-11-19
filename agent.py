@@ -12,7 +12,12 @@ import re
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from context_policy import ContextBlock, select_context, update_stats
+from context_policy import (
+    ContextBlock,
+    budget_pressure,
+    select_context,
+    update_stats,
+)
 from eviction import est, format_headline, render_index, rollup
 from kernel import Kernel, SandboxedKernel
 
@@ -243,9 +248,11 @@ def _select_agent_context(
     blocks = _agent_context_blocks(
         source_index, trace_index, current_state, latest_observation, run_id
     )
-    considered = est("\n\n".join(block.render() for block in blocks))
     checkpoint = "turn"
-    if considered > budget:
+    # The gate owns the definition. Counting the unbudgeted trace index here
+    # named budget_pressure on turns where the gate saw none and skipped Jev
+    # with no reason.
+    if budget_pressure(blocks, budget):
         checkpoint = "budget_pressure"
     elif latest_observation and est(latest_observation[1]) > max(100, budget // 2):
         checkpoint = "large_tool_result"
@@ -289,8 +296,13 @@ def _run(
     def record_answer(text):
         """The side effect alone. A sandboxed kernel's child raises its own
         stop signal locally, so replaying Done in the parent would throw out of
-        run() instead of ending a cell that already ended."""
-        answer["text"] = str(text)
+        run() instead of ending a cell that already ended.
+
+        The first answer wins. The prompt says to call this exactly once, and
+        a cell that caught Done and submitted again used to overwrite the
+        answer it had already committed."""
+        if answer["text"] is None:
+            answer["text"] = str(text)
 
     def submit_answer(text):
         record_answer(text)
@@ -330,7 +342,7 @@ def _run(
     # NARU_KERNEL=sandbox runs cells in a child process, which survives a
     # runaway loop or a crash. It needs the log by path, so it is opt-in rather
     # than default: bench.py ingests into an in-memory database that no child
-    # can open. The child must open a file-backed store.
+    # can open. See ADR 0007.
     path = getattr(ms, "path", None)
     if os.environ.get("NARU_KERNEL") == "sandbox" and path and path != ":memory:":
         kernel = SandboxedKernel(
@@ -375,6 +387,13 @@ def _run(
 
     try:
         for turn in range(max_turns):
+            # Describing a resident object can run a model method that calls
+            # submit_answer. That answer is recorded, so it is returned, with
+            # the turns that really ran: no model call has been made for this
+            # one yet. It used to surface as (None, max_turns, 0).
+            digest = kernel.digest()
+            if answer["text"] is not None:
+                break
             turns_used = turn + 1
             parts = [header]
             selection, last_jev_checkpoint = _select_agent_context(
@@ -395,7 +414,7 @@ def _run(
             # The resident digest is a stable kernel summary, not part of the
             # mutable working-view budget. It stays visible while the policy
             # bounds indexes, state, and the latest observation below it.
-            parts.append(kernel.digest())
+            parts.append(digest)
             if selection.text:
                 parts.append(selection.text)
             peak = max(peak, selection.selected_tokens)
@@ -558,24 +577,23 @@ def run_naru(
         else:
             stats["context_jev_unavailable"] = 1
     try:
-        try:
-            return _run(
-                ms,
-                question,
-                question_date,
-                backend,
-                max_turns,
-                budget,
-                verbose,
-                trace,
-                rubric,
-                index,
-                mode,
-                evaluator,
-                stats,
-            )
-        except Done:
-            return None, max_turns, 0
+        # No `except Done` here. Done cannot leave the kernel: run() reports
+        # it as the cell's stop and digest() guards each variable.
+        return _run(
+            ms,
+            question,
+            question_date,
+            backend,
+            max_turns,
+            budget,
+            verbose,
+            trace,
+            rubric,
+            index,
+            mode,
+            evaluator,
+            stats,
+        )
     finally:
         if owned_evaluator and evaluator is not None:
             evaluator.close()
@@ -683,6 +701,17 @@ def demo():
     assert "content" not in json.dumps(jev_seen["state"])
     jev_surface.close()
 
+    # Budget pressure has one definition, in the gate. The trace index is
+    # unbudgeted, so a large one alone is not pressure: the agent must not
+    # name a checkpoint that the gate then skips with no reason.
+    big_trace = [[{"lo": i, "hi": i, "headline": "x" * 300, "session_id": "run"}
+                  for i in range(1, 6)]]
+    calm, _ = _select_agent_context(
+        [], big_trace, None, (9, "short"), "run", 1, "q", 200,
+        "shadow", fake_jev, {}, jev_backend, None,
+    )
+    assert calm.checkpoint == "turn" and not calm.jev_invoked, calm.checkpoint
+
     refusal = [
         "I don't have a record of that conversation and no search tool here.",
         "I still do not know.",
@@ -785,6 +814,31 @@ def demo():
     assert "ERROR: ValueError" in invalid.sql_query(
         "SELECT content FROM conversation_history WHERE kind='agent_observation'"
     )[0].content
+
+    # submit_answer is called once. A cell that catches Done and submits again
+    # must not replace the answer it already committed.
+    twice = MemorySurface(":memory:")
+    again = (
+        "```python\ntry:\n    submit_answer('first')\nexcept Exception:\n    pass\n"
+        "submit_answer('second')\n```"
+    )
+    assert run_naru(twice, "twice", lambda *a, **k: again, max_turns=2)[0] == "first"
+
+    # An answer submitted while the digest describes a resident object is
+    # returned with the turns that really ran. It used to come back as
+    # (None, max_turns, 0).
+    in_digest = MemorySurface(":memory:")
+    dg = {"n": 0}
+
+    def digest_backend(prompt, system=None, nudge=None):
+        dg["n"] += 1
+        return (
+            "```python\nclass L(list):\n    def __getitem__(s, i):\n"
+            "        submit_answer('found')\nx = L([1])\n```"
+        )
+
+    assert run_naru(in_digest, "digest", digest_backend, max_turns=4)[:2] == ("found", 1)
+    assert dg["n"] == 1, "a model call was paid for after the answer was recorded"
 
     near = MemorySurface(":memory:")
     near_script = [
@@ -915,6 +969,16 @@ def demo():
         sans, _sturns, _ = run_naru(
             fms, "What car do I drive?", sandbox_backend, max_turns=5, budget=800
         )
+        # The same cell must end the same way in both kernels. The child's
+        # headline stub cannot validate, so this cell runs on to submit_answer
+        # there; the answer must not be recorded and the error must show, as
+        # in the `invalid` case above.
+        rejected = run_naru(
+            fms,
+            "bad state",
+            lambda *a, **k: "```python\nheadline(task=1)\nsubmit_answer('A')\n```",
+            max_turns=1,
+        )[0]
     finally:
         SandboxedKernel.close = close
         if prev is None:
@@ -922,13 +986,18 @@ def demo():
         else:
             os.environ["NARU_KERNEL"] = prev
     assert sans == "A blue Subaru Outback", sans
+    assert rejected is None, rejected
+    assert "ERROR: ValueError: headline needs" in fms.sql_query(
+        "SELECT content FROM conversation_history WHERE kind='agent_observation' "
+        "ORDER BY seq DESC LIMIT 1"
+    )[0].content
     seen = [p for p in sn["prompts"] if "PID " in p]
     assert seen, "the pid cell never came back"
     assert f"PID {os.getpid()}" not in seen[-1], (
         "the cell ran in THIS process — the sandbox branch was not taken"
     )
     assert closed and closed[0].poll() is not None, "run_naru did not close its kernel"
-    for surface in (ms, states, invalid, near, recovery, fms):
+    for surface in (ms, states, invalid, twice, in_digest, near, recovery, fms):
         surface.close()
 
     print(

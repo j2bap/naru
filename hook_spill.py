@@ -182,6 +182,10 @@ def main():
         event = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return 0  # not our business; pass through untouched
+    if not isinstance(event, dict):
+        # Valid JSON that is not a hook event, such as `[1]`. Reading a field
+        # from it raised, and a hook that exits 1 breaks the tool call.
+        return 0
 
     # NARU_SPILL_DEBUG=<path> records the real event shape. Claude Code's
     # per-tool response schemas are not documented, and a replacement that does
@@ -309,6 +313,8 @@ def demo():
     # malformed stdin must never break the tool call
     p = subprocess.run(me, input="not json", capture_output=True, text=True, env=env)
     assert p.returncode == 0 and not p.stdout.strip()
+    # and neither must JSON that is not an event object
+    assert run([1]) is None and run("text") is None
 
     saved = len(big) - len(upd["stdout"])
     print(

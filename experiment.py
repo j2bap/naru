@@ -397,8 +397,13 @@ def _delta_percent(candidate, baseline, key):
 
 
 def _adoption(baseline, candidate, max_quality_drop, max_failure_increase, max_latency_increase):
-    """Apply explicit guardrails and never infer missing cost evidence."""
-    reasons = []
+    """Apply explicit guardrails and never infer missing cost evidence.
+
+    A failed guardrail is a measured result, so it decides "no-go" whatever
+    else is unknown. "defer" is only for a run where nothing failed and
+    something the decision needs was not measured.
+    """
+    failed, unmeasured = [], []
     quality_delta = None
     failure_delta = None
     latency_delta = _delta_percent(candidate, baseline, "latency_ms_mean")
@@ -412,32 +417,27 @@ def _adoption(baseline, candidate, max_quality_drop, max_failure_increase, max_l
             6,
         )
         if quality_delta < -max_quality_drop:
-            reasons.append("task success dropped beyond the quality guardrail")
+            failed.append("task success dropped beyond the quality guardrail")
     if baseline.get("error_rate") is not None and candidate.get("error_rate") is not None:
         failure_delta = round(
             100 * (candidate["error_rate"] - baseline["error_rate"]), 6
         )
         if failure_delta > max_failure_increase:
-            reasons.append("error rate increased beyond the failure guardrail")
+            failed.append("error rate increased beyond the failure guardrail")
     if latency_delta is None:
-        reasons.append("latency is not measured for both runs")
+        unmeasured.append("latency is not measured for both runs")
     elif latency_delta > max_latency_increase:
-        reasons.append("latency increased beyond the latency guardrail")
+        failed.append("latency increased beyond the latency guardrail")
 
     base_cost = baseline.get("task_cost_usd_per_success")
     candidate_cost = candidate.get("task_cost_usd_per_success")
     if base_cost is None or candidate_cost is None:
-        reasons.append("cost per successful task is unknown")
-        decision = "defer"
+        unmeasured.append("cost per successful task is unknown")
     elif candidate_cost >= base_cost:
-        reasons.append("candidate is not cheaper per successful task")
-        decision = "no-go"
-    elif reasons:
-        decision = "no-go"
-    else:
-        decision = "go"
+        failed.append("candidate is not cheaper per successful task")
+    reasons = failed + unmeasured
     return {
-        "decision": decision,
+        "decision": "no-go" if failed else "defer" if unmeasured else "go",
         "quality_delta_points": quality_delta,
         "failure_delta_points": failure_delta,
         "latency_delta_percent": latency_delta,
@@ -809,6 +809,41 @@ def demo():
         unknown = compare_runs(base_path, candidate_path)
         assert unknown["adoption"]["decision"] == "defer", unknown
         assert unknown["pricing"]["status"] == "unknown"
+        # An unknown cost must not hide a measured failure. The same unpriced
+        # comparison with a candidate that lost a task is "no-go", and both
+        # reasons are reported.
+        worse = json.loads(candidate_path.read_text())
+        worse["rows"][0]["task_success"] = False
+        worse_path = root / "worse.json"
+        worse_path.write_text(json.dumps(worse))
+        failed = compare_runs(base_path, worse_path)["adoption"]
+        assert failed["decision"] == "no-go", failed
+        assert failed["reasons"] == [
+            "task success dropped beyond the quality guardrail",
+            "cost per successful task is unknown",
+        ], failed
+        # Unmeasured latency is missing evidence, not a failed guardrail: a
+        # cheaper candidate that passed everything else waits for it.
+        untimed = json.loads(candidate_path.read_text())
+        for row in untimed["rows"]:
+            row["latency_ms"] = None
+        untimed_path = root / "untimed.json"
+        untimed_path.write_text(json.dumps(untimed))
+        waiting = compare_runs(base_path, untimed_path, prices=prices)["adoption"]
+        assert waiting["decision"] == "defer", waiting
+        assert waiting["reasons"] == ["latency is not measured for both runs"]
+        # A worker that died has no cost and no latency. Its row must make the
+        # run's cost unknown and stay out of the latency mean, not count as a
+        # free, instant task.
+        crashed = json.loads(base_path.read_text())
+        crashed["rows"][1].update(
+            task_cost_usd=None, latency_ms=None, errors=1
+        )
+        crashed_path = root / "crashed.json"
+        crashed_path.write_text(json.dumps(crashed))
+        lost = compare_runs(crashed_path, candidate_path, prices=prices)
+        assert lost["baseline"]["metrics"]["cost_status"] == "unknown", lost
+        assert lost["baseline"]["metrics"]["latency_ms_mean"] == 100, lost
         unmeasured = json.loads(base_path.read_text())
         unmeasured["config"]["tokens_measured"] = False
         unmeasured_path = root / "unmeasured.json"

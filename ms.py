@@ -39,6 +39,9 @@ END = "<!-- naru:end -->"
 
 # Age is the right rule for spilled tool output and the wrong one for a
 # decision a human made. Anything else a prune would take, it still takes.
+# The trace a pending claim cites stays too. It is always older than the
+# claim, so an age rule deleted it first and a later promotion kept a fact
+# whose evidence was gone.
 # Words too common to tie a prompt to a claim.
 _STOPWORDS = frozenset("""
     about after also another because been before being both does doing done
@@ -69,7 +72,7 @@ PRUNE_KEEP = """ AND NOT (
     (kind IN ('claim','skill') AND promoted <> 0)
     OR EXISTS (
         SELECT 1 FROM conversation_history AS curated
-        WHERE curated.kind IN ('claim','skill') AND curated.promoted = 1
+        WHERE curated.kind IN ('claim','skill') AND curated.promoted IN (0, 1)
           AND curated.source_run_id = conversation_history.session_id
           AND conversation_history.seq BETWEEN curated.source_seq_lo
                                            AND curated.source_seq_hi
@@ -245,6 +248,11 @@ class MemorySurface:
                 doc_hash     TEXT NOT NULL,
                 delivered_at TEXT,
                 PRIMARY KEY(agent_id, session_id)
+            );
+            -- the log head when the doc last changed; see doc_version()
+            CREATE TABLE IF NOT EXISTS doc_state(
+                id      INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL
             );
             -- files `naru inject` wrote; every decision rewrites them
             CREATE TABLE IF NOT EXISTS inject_target(
@@ -612,7 +620,7 @@ class MemorySurface:
         Beside `prune` and sharing PRUNE_KEEP with it deliberately. The CLI
         used to re-derive this with an age-only predicate, so `--dry-run`
         reported that it would delete promoted claims that `prune` then
-        correctly refused to touch — the guard against pruning approved claims was
+        correctly refused to touch — the guard ADR 0005 exists for was
         invisible in the one command you run before a destructive one.
         """
         row = self.db.execute(
@@ -633,8 +641,9 @@ class MemorySurface:
     def prune(self, before_iso):
         """Delete rows created before `before_iso`. Returns rows removed.
 
-        A decided claim or skill, and the trace it cites, is never pruned by
-        age. Age is the right rule for spilled tool output.
+        A decided claim or skill is never pruned by age, and neither is the
+        trace a promoted or pending one cites. Age is the right rule for
+        spilled tool output.
 
         Blob files for the deleted rows are removed too.
         """
@@ -721,27 +730,66 @@ class MemorySurface:
             ).fetchall()
         ]
 
-    def decide(self, seq, keep):
+    def _verdict(self, seq, new, allowed):
+        """Move one claim or skill to verdict `new` if its verdict is in `allowed`.
+
+        One transaction reads the old verdict and writes the new one, so two
+        writers cannot both act on the same pending claim. A change that adds
+        or removes a promoted row also stamps the doc version.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT promoted FROM conversation_history WHERE seq=?"
+                " AND kind IN ('claim','skill')",
+                (seq,),
+            ).fetchone()
+            if row is None or row["promoted"] not in allowed or row["promoted"] == new:
+                self.db.commit()
+                return 0
+            self.db.execute(
+                "UPDATE conversation_history SET promoted=? WHERE seq=?", (new, seq)
+            )
+            if 1 in (row["promoted"], new):
+                self.db.execute(
+                    "INSERT OR REPLACE INTO doc_state(id, version)"
+                    " SELECT 1, COALESCE(MAX(seq), 0) FROM conversation_history"
+                )
+            self.db.commit()
+            return 1
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def decide(self, seq, keep, expect=None):
         """Promote pending claims/skills; drop ones not already dropped.
+
+        `expect` names the verdict the caller last saw. The inbox passes it,
+        because a person answers a claim they read a while ago: without it,
+        "archive" retired a fact another writer had promoted in the meantime,
+        and moved one that writer had rejected back into archive search.
 
         ponytail: verdicts are columns, not events; add kind='verdict' for who/when.
         """
-        cur = self.db.execute(
-            "UPDATE conversation_history SET promoted=? WHERE seq=?"
-            " AND kind IN ('claim','skill')"
-            + (" AND promoted=0" if keep else " AND promoted<>-1"),
-            (1 if keep else -1, seq),
-        )
-        self.db.commit()
-        return cur.rowcount
+        if keep:
+            allowed = (0,)
+        else:
+            allowed = (0, 1, -2) if expect is None else (expect,)
+        return self._verdict(seq, 1 if keep else -1, allowed)
 
     def set_check(self, seq, command, output):
-        """Record the check command and the output a person just confirmed."""
-        self.db.execute(
-            "UPDATE conversation_history SET check_cmd=?, check_out=? WHERE seq=?",
+        """Record the check command and the output a person just confirmed.
+
+        Only a promoted fact has a confirmed output. Returns 0 when another
+        writer retired the fact first.
+        """
+        cur = self.db.execute(
+            "UPDATE conversation_history SET check_cmd=?, check_out=? WHERE seq=?"
+            " AND kind IN ('claim','skill') AND promoted=1",
             (command, output, seq),
         )
         self.db.commit()
+        return cur.rowcount
 
     def checked(self):
         """Promoted claims and skills that carry a check command."""
@@ -754,7 +802,7 @@ class MemorySurface:
         current.
 
         A copy of the database, such as a backup or a test opened through
-        NARU_NOTES, carries the same rows. Matching on store_id
+        NARU_NOTES, carries the same rows. Matching on store_id (ADR 0011)
         stops the copy's decisions from rewriting the real files. A row from
         before store_id existed matches nothing until `inject` writes it again.
         """
@@ -773,20 +821,15 @@ class MemorySurface:
                         (path, self.store_id))
         self.db.commit()
 
-    def reject(self, seq):
+    def reject(self, seq, expect=None):
         """Mark a claim or skill wrong. Archive search never surfaces it.
 
         `decide(seq, False)` archives instead: the claim stays out of the doc
         but can still be surfaced as an unreviewed lead. It also moves a
         rejected claim back to the archive, so a rejection can be undone.
+        `expect` works as in `decide`.
         """
-        cur = self.db.execute(
-            "UPDATE conversation_history SET promoted=-2 WHERE seq=?"
-            " AND kind IN ('claim','skill') AND promoted<>-2",
-            (seq,),
-        )
-        self.db.commit()
-        return cur.rowcount
+        return self._verdict(seq, -2, (0, 1, -1) if expect is None else (expect,))
 
     def archive(self, query, scope=None, k=3):
         """Unreviewed claims that match a prompt: pending or archived, never
@@ -814,13 +857,19 @@ class MemorySurface:
         return out
 
     def doc_version(self):
-        """Highest promoted seq — the version of the doc a reader last saw.
+        """The log head when the doc last changed: the version a reader saw.
 
         Deliberately not MAX(seq) over the whole log: an unrelated note or a
         spilled tool result must not read as "the doc moved under you".
+
+        It was MAX(seq) over promoted rows. That number did not move when a
+        fact was retired or when an older pending claim was promoted, so a
+        claim written against the earlier doc still read as current. A store
+        that has made no decision since this was added falls back to it.
         """
         return self.db.execute(
-            "SELECT COALESCE(MAX(seq), 0) FROM conversation_history WHERE promoted=1"
+            "SELECT COALESCE((SELECT version FROM doc_state WHERE id=1),"
+            " (SELECT MAX(seq) FROM conversation_history WHERE promoted=1), 0)"
         ).fetchone()[0]
 
     def _promoted(self, scope=None):
@@ -1494,6 +1543,35 @@ def demo():
     v = ms.doc_version()
     ms.append("note", "unrelated", kind="note", created_at="2026-08-27T11:00:00")
     assert ms.doc_version() == v, "an unrelated row advanced the doc version"
+    # Every doc change moves the version, not only a promotion with a higher
+    # seq. A claim written against the earlier doc must read as stale after a
+    # fact is retired, and after an older pending claim is promoted.
+    older = ms.append("agent", "older pending", kind="claim", created_at="2026-08-27T11:01:00")
+    newer = ms.append("agent", "newer fact", kind="claim", created_at="2026-08-27T11:02:00")
+    ms.decide(newer, True)
+    v = ms.doc_version()
+    late = ms.append("agent", "late claim", kind="claim", base_seq=v,
+                     created_at="2026-08-27T11:03:00")
+    ms.decide(older, True)
+    assert ms.doc_version() > v, "promoting an older claim left the doc version unchanged"
+    v = ms.doc_version()
+    ms.append("note", "between", kind="note", created_at="2026-08-27T11:04:00")
+    assert ms.reject(newer) == 1 and ms.doc_version() > v, (
+        "retiring a fact left the doc version unchanged"
+    )
+    v = ms.doc_version()
+    ms.append("note", "between", kind="note", created_at="2026-08-27T11:05:00")
+    assert ms.decide(late, False) == 1 and ms.doc_version() == v, (
+        "archiving a pending claim moved the doc version"
+    )
+    # A caller that names the verdict it saw must not undo another writer.
+    assert ms.decide(older, False, expect=0) == 0, "an inbox archive retired a promoted fact"
+    assert ms.decide(newer, False, expect=0) == 0, "an inbox archive undid a rejection"
+    assert ms.reject(older, expect=0) == 0, "an inbox reject retired a promoted fact"
+    assert ms.expand(older)[0].promoted == 1 and ms.expand(newer)[0].promoted == -2
+    assert ms.set_check(late, "true", "") == 0, "an archived claim got a confirmed check"
+    assert ms.expand(late)[0].check_cmd is None
+    assert ms.decide(older, False) == 1
 
     # a newline inside a claim must not become a second top-level line
     nl = ms.append(
@@ -1554,6 +1632,18 @@ def demo():
         source_seq_lo=dropped_reply, source_seq_hi=dropped_obs,
     )
     ms.decide(dropped_cited, False)
+    # The trace a pending claim cites is older than the claim. An age rule
+    # that deleted it left a later promotion without its evidence.
+    pending_run = "pending-run"
+    pending_obs = ms.append(
+        "tool", "pending old observation", kind="agent_observation",
+        session_id=pending_run, created_at="2000-01-01T00:00:02",
+    )
+    pending_cited = ms.append(
+        "agent", "pending claim with trace", kind="claim", topic_key="pending.trace",
+        created_at="2026-08-27T10:05:00", source_run_id=pending_run,
+        source_seq_lo=pending_obs, source_seq_hi=pending_obs,
+    )
     stale_note = ms.append(
         "note", "ancient note", kind="note", created_at="2000-01-01T00:00:00"
     )
@@ -1574,6 +1664,10 @@ def demo():
     assert ms.expand(dropped_reply, dropped_obs, session_id=dropped_run) == [], (
         "prune kept dropped provenance"
     )
+    assert ms.expand(pending_obs, session_id=pending_run), (
+        "prune deleted the trace a pending claim cites"
+    )
+    assert ms.decide(pending_cited, False) == 1
     assert ms.expand(stale_note) == [], "prune left the ordinary old row"
     assert "ancient decided claim" in ms.doc()
 

@@ -105,6 +105,16 @@ def _opt(args, name, default=None):
     return val
 
 
+def _has_block(text):
+    """True when `text` holds a begin marker with an end marker after it.
+
+    Both markers in the wrong order is not a block. `_splice` split on the
+    begin marker and then found no end marker after it, so a promotion saved
+    its verdict and then died before it rewrote any file.
+    """
+    return BEGIN in text and END in text.split(BEGIN, 1)[1]
+
+
 def _splice(path, text):
     """Write the doc into `path` between markers, never over the whole file.
 
@@ -119,7 +129,7 @@ def _splice(path, text):
         old = p.read_text()
     except FileNotFoundError:
         old = ""
-    if BEGIN in old and END in old:
+    if _has_block(old):
         head, rest = old.split(BEGIN, 1)
         new = head + block + rest.split(END, 1)[1].lstrip("\n")
     else:
@@ -135,50 +145,68 @@ def _j_dumps(events):
     return "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in events)
 
 
+# The whole word or its first letter. A first-letter match on any word read
+# "pass" as promote, "approve" as archive, and "retain" as reject.
+INBOX_ANSWERS = {
+    "p": True, "promote": True,
+    "a": False, "archive": False, "d": False, "drop": False,
+    "r": "reject", "reject": "reject",
+}
+
+
 def _apply(ms, seq, answer):
     """Act on one inbox answer. Returns the line to print.
 
     Split out of the input() loop so promote / archive / reject / skip can be asserted
     without a terminal, and so the rowcount is not thrown away: another writer
-    can decide the same claim while the human is still reading it.
+    can decide the same claim while the human is still reading it. Every
+    answer therefore applies only to a claim that is still pending.
     """
-    if answer.startswith("p"):
+    verdict = INBOX_ANSWERS.get(answer)
+    if verdict is True:
         return "promoted" if _decide(ms, seq, True) else "already decided elsewhere"
-    if answer.startswith(("d", "a")):
-        return "archived" if _decide(ms, seq, False) else "already decided elsewhere"
-    if answer.startswith("r"):
-        return "rejected" if _reject(ms, seq) else "already decided elsewhere"
+    if verdict is False:
+        return ("archived" if _decide(ms, seq, False, expect=0)
+                else "already decided elsewhere")
+    if verdict == "reject":
+        return "rejected" if _reject(ms, seq, expect=0) else "already decided elsewhere"
     return "skipped"
 
 
-def _reject(ms, seq):
+def _reject(ms, seq, expect=None):
     """Mark a claim wrong so archive search never surfaces it."""
-    changed = ms.reject(seq)
+    changed = ms.reject(seq, expect)
     if changed:
         _refresh(ms)  # a rejected fact may have been in the doc
     return changed
 
 
-def _decide(ms, seq, keep):
+def _decide(ms, seq, keep, expect=None):
     """Record one verdict, then rewrite every file `inject` wrote.
 
     A file-based harness reads its context file and nothing else, so it never
     sees a promotion until that file changes. Claude Code ran on a doc missing
     15 promotions before this existed.
     """
-    changed = ms.decide(seq, keep)
+    changed = ms.decide(seq, keep, expect)
     if changed:
         if keep:
             row = ms.sql_query(
                 "SELECT check_cmd FROM conversation_history WHERE seq=?", (seq,))
             if row and row[0].check_cmd:
-                ms.set_check(seq, row[0].check_cmd, _run_check(row[0].check_cmd))
+                # A failed command confirms nothing. Its error text used to
+                # become the baseline, so the fact read as confirmed until
+                # the day the command worked. Without a baseline the inbox
+                # keeps listing the fact as stale.
+                ok, out = _check(row[0].check_cmd)
+                if ok:
+                    ms.set_check(seq, row[0].check_cmd, out)
         _refresh(ms)
     return changed
 
 
-def _run_check(command):
-    """Run a fact's check command and return its output as the evidence.
+def _check(command):
+    """Run a fact's check command. Returns (ran cleanly, output as evidence).
 
     A fact goes stale when what it was checked against changes: a tool
     version, or the files it describes. MemTrace (arXiv 2610.04838) checks
@@ -189,11 +217,17 @@ def _run_check(command):
         p = subprocess.run(argv, capture_output=True, text=True,
                            timeout=CHECK_SECONDS, cwd=os.path.expanduser("~"))
     except subprocess.TimeoutExpired:
-        return f"timed out after {CHECK_SECONDS}s"
+        return False, f"timed out after {CHECK_SECONDS}s"
     except (OSError, ValueError) as error:
-        return f"failed: {error}"
-    out = p.stdout.strip() if p.returncode == 0 else f"exit {p.returncode}: {p.stderr.strip()}"
-    return out[:1000]
+        return False, f"failed: {error}"
+    if p.returncode:
+        return False, f"exit {p.returncode}: {p.stderr.strip()}"[:1000]
+    return True, p.stdout.strip()[:1000]
+
+
+def _run_check(command):
+    """The output of a check command, whether or not it ran cleanly."""
+    return _check(command)[1]
 
 
 def _stale(ms):
@@ -204,11 +238,13 @@ def _stale(ms):
 
 def _apply_stale(ms, row, now, answer):
     """Act on one stale fact: keep records the new output as confirmed."""
-    if answer.startswith("k"):
-        ms.set_check(row.seq, row.check_cmd, now)
-        return "kept; check updated"
-    if answer.startswith("d"):
-        return "dropped" if _decide(ms, row.seq, False) else "already decided elsewhere"
+    if answer in ("k", "keep"):
+        if ms.set_check(row.seq, row.check_cmd, now):
+            return "kept; check updated"
+        return "already decided elsewhere"
+    if answer in ("d", "drop"):
+        return ("dropped" if _decide(ms, row.seq, False, expect=1)
+                else "already decided elsewhere")
     return "skipped"
 
 
@@ -224,10 +260,15 @@ def _refresh(ms):
             old = pathlib.Path(path).read_text()
         except (OSError, UnicodeDecodeError):
             old = ""
-        if BEGIN not in old or END not in old:
+        if not _has_block(old):
             ms.forget_target(path)
             continue
-        _splice(path, text)
+        try:
+            _splice(path, text)
+        except OSError as error:
+            # The verdict is already saved. One file that cannot be written
+            # must not stop the other files or the inbox.
+            print(f"naru: could not update {path}: {error}", file=sys.stderr)
 
 
 def _show(ms, rows, run, at):
@@ -238,6 +279,7 @@ def _show(ms, rows, run, at):
     said they were read. Whole rows print up to SHOW_CHARS and a receipt
     covers only those. A single larger row prints one slice per call from
     --at, and a slice writes no receipt: it does not prove the row was read.
+    A slice writes a `show_part` event that only the spill statistics count.
     """
     run_flag = f" --run {shlex.quote(run)}" if run else ""
     shown, used = [], 0
@@ -249,6 +291,10 @@ def _show(ms, rows, run, at):
             end = at + len(part)
             print(f"{head} | chars {at:,}-{end:,} of {len(r.content):,}")
             print(part)
+            # Not a receipt: a slice does not prove the row was read, so a
+            # claim still cannot cite it. It does show that a spill this
+            # large was reopened, which `naru stats` could never see.
+            metrics.record_show_part(ms.store_id, run, r.seq)
             if end < len(r.content):
                 print(f"[naru: not done. Run: naru show {r.seq} --at {end}{run_flag}]")
             elif i + 1 < len(rows):
@@ -668,8 +714,11 @@ def main(argv):
         if cmd == "promote":
             row = ms.sql_query("SELECT check_cmd, check_out FROM conversation_history"
                                " WHERE seq=?", (int(args[0]),))[0]
-            if row.check_cmd:
+            if row.check_cmd and row.check_out is not None:
                 print(f"  check: {row.check_cmd} -> {row.check_out[:120]}")
+            elif row.check_cmd:
+                print(f"  check failed, so no output is confirmed: {row.check_cmd}\n"
+                      "  `naru inbox` lists the fact as stale until you keep or drop it")
 
     elif cmd == "inbox":
         pend, stale = ms.pending(), _stale(ms)
@@ -711,7 +760,8 @@ def main(argv):
                   + (f" · key: {c.topic_key}" if c.topic_key else "")
                   + (f" · repo: {c.scope}" if c.scope else ""))
             print(f"  + {c.content.strip()}")
-            print(f"  check: {c.check_cmd}\n  was: {c.check_out}\n  now: {now}")
+            was = "(never confirmed)" if c.check_out is None else c.check_out
+            print(f"  check: {c.check_cmd}\n  was: {was}\n  now: {now}")
             try:
                 ans = input("  keep / drop / skip ? ").strip().lower()
             except EOFError:
@@ -741,7 +791,10 @@ def main(argv):
         if not row or row[0].promoted != 1:
             print(f"seq {seq} is not a promoted claim or skill", file=sys.stderr)
             return 1
-        out = _run_check(args[1])
+        ok, out = _check(args[1])
+        if not ok:
+            print(f"check not recorded, the command failed: {out[:120]}", file=sys.stderr)
+            return 1
         ms.set_check(seq, args[1], out)
         print(f"seq {seq} check recorded: {out[:120]}")
 
@@ -1085,7 +1138,7 @@ def _demo(real_stdin):
     assert "Inbox marker fact." in hand.read_text(), "inbox promote left a file stale"
     assert main(["drop", str(marker), "--yes"]) == 0
     # A copy of the store carries the same file list, but its decisions must
-    # never rewrite the real files.
+    # never rewrite the real files (ADR 0011).
     import sqlite3
     copy_db = DB.parent / "copy.db"
     with contextlib.closing(sqlite3.connect(DB)) as src, \
@@ -1391,6 +1444,75 @@ def _demo(real_stdin):
         assert main(["check", str(old), f"cat {version}", "--yes"]) == 0
     assert [r.check_out for r in store().checked()] == ["3.0"]
     assert main(["drop", str(old), "--yes"]) == 0
+    # A check that fails confirms nothing: promotion records no baseline and
+    # the inbox keeps listing the fact.
+    assert main(["claim", "Fact with a broken check.", "--key", "broken.check",
+                 "--check", f"cat {DB.parent / 'missing'}"]) == 0
+    broken = store().pending()[-1].seq
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["promote", str(broken), "--yes"]) == 0
+    assert "check failed" in buf.getvalue(), buf.getvalue()
+    assert [r.check_out for r in store().checked()] == [None], (
+        "a failed check became the confirmed baseline"
+    )
+    assert [r.seq for r, _ in _stale(store())] == [broken], "an unconfirmed fact left the inbox"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["inbox"])
+    assert "was: (never confirmed)" in buf.getvalue(), buf.getvalue()
+    assert main(["check", str(broken), f"cat {DB.parent / 'missing'}", "--yes"]) == 1, (
+        "a failing command was attached as a confirmed check"
+    )
+    # A stale answer acts only on a fact that is still promoted.
+    row, now = _stale(store())[0]
+    assert store().reject(broken) == 1
+    assert _apply_stale(store(), row, now, "d") == "already decided elsewhere", (
+        "a stale drop undid a rejection"
+    )
+    assert _apply_stale(store(), row, now, "k") == "already decided elsewhere"
+    assert _apply_stale(store(), row, now, "delete") == "skipped"
+
+    # An inbox answer is the whole word or its first letter, and it applies
+    # only to a claim that is still pending.
+    assert main(["claim", "Inbox answer fact.", "--key", "inbox.answer"]) == 0
+    seen = store().pending()[-1].seq
+    for word in ("pass", "postpone", "approve", "accept", "retain", "review", ""):
+        assert _apply(store(), seen, word) == "skipped", word
+    assert [r.seq for r in store().pending()] == [seen], "a loose answer decided a claim"
+    assert store().decide(seen, True) == 1  # another writer promotes it
+    assert _apply(store(), seen, "archive") == "already decided elsewhere", (
+        "an inbox archive retired a fact promoted elsewhere"
+    )
+    assert _apply(store(), seen, "r") == "already decided elsewhere"
+    assert "Inbox answer fact." in store().doc()
+    assert store().reject(seen) == 1  # another writer rejects it
+    assert _apply(store(), seen, "a") == "already decided elsewhere", (
+        "an inbox archive made a rejected claim searchable again"
+    )
+
+    # Markers in the wrong order are not a block, and a file that cannot be
+    # written must not stop a decision that is already saved.
+    reversed_file = DB.parent / "reversed.md"
+    locked_file = DB.parent / "locked.md"
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert main(["inject", str(reversed_file)]) == 0
+        assert main(["inject", str(locked_file)]) == 0
+    reversed_file.write_text(f"mine\n{END}\nstuff\n{BEGIN}\n")
+    locked_file.chmod(0o444)
+    assert main(["claim", "Fact after bad files.", "--key", "bad.files"]) == 0
+    after = store().pending()[-1].seq
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert main(["promote", str(after), "--yes"]) == 0, "a bad inject file broke a promotion"
+    assert reversed_file.read_text() == f"mine\n{END}\nstuff\n{BEGIN}\n"
+    assert os.path.realpath(reversed_file) not in store().inject_targets()
+    assert "Fact after bad files." in (codex_home / "AGENTS.md").read_text(), (
+        "one bad file stopped the refresh of the others"
+    )
+    locked_file.chmod(0o644)
+    store().forget_target(os.path.realpath(locked_file))
+    assert main(["drop", str(after), "--yes"]) == 0
+
     assert _run_check("definitely-not-a-command-xyz").startswith("failed")
     assert _run_check(f"cat {DB.parent / 'missing'}").startswith("exit 1")
     saved_check_seconds = CHECK_SECONDS
@@ -1416,7 +1538,7 @@ def _demo(real_stdin):
         "tool", "evidence", kind="agent_observation", session_id=trace_run,
         created_at="2026-08-27T12:00:01",
     )
-    # Evidence rule: the evidence exists, but nobody has opened it yet.
+    # ADR 0010: the evidence exists, but nobody has opened it yet.
     assert main([
         "claim", "unread", "--key", "unread.fact", "--run", trace_run,
         "--source", f"{reply}:{observation}",
@@ -1493,7 +1615,7 @@ def _demo(real_stdin):
         assert main(["show", str(reply), str(observation), "--run", trace_run]) == 0
     assert "evidence" in buf.getvalue()
 
-    # Evidence rule: show prints parts a harness keeps whole, and a receipt covers
+    # ADR 0010: show prints parts a harness keeps whole, and a receipt covers
     # only the rows it printed whole.
     saved_show_chars = SHOW_CHARS
     globals()["SHOW_CHARS"] = 200
@@ -1525,6 +1647,10 @@ def _demo(real_stdin):
         assert not metrics.opened(ms.store_id, page, big, big), (
             "a slice of a row wrote a receipt for the whole row"
         )
+        assert any(
+            e["e"] == "show_part" and e.get("seq") == big and e.get("run") == page
+            for e in metrics.read()
+        ), "a slice left nothing for the spill statistics to count"
         assert main(["show", str(big), "--at", "-1"]) == 2
     finally:
         globals()["SHOW_CHARS"] = saved_show_chars

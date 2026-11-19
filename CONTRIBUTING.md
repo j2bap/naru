@@ -1,119 +1,100 @@
 # Contributing
 
-[README](README.md) · [Architecture](docs/research.md) · [Benchmark guide](docs/benchmark.md)
+Small repo, few rules, and they are the ones a change actually gets rejected
+for. Read them before writing code, not after.
 
-Keep each change focused. Explain the behavior you change, update the relevant
-guide, and include the commands you ran with their results in your pull
-request.
-
-## Run the offline checks
-
-From the repository root, run:
+## Run this first
 
 ```bash
-(
-  set -e
-  python3 ms.py
-  python3 kernel.py
-  python3 eviction.py
-  python3 agent.py
-  python3 naru.py --selfcheck
-  python3 hook_spill.py --selfcheck
-  python3 noise.py --selfcheck
-  python3 metrics.py --selfcheck
-  python3 backend.py --selfcheck
-  python3 bench.py --selfcheck
-  python3 beam.py --selfcheck
-  python3 regrade.py --selfcheck
-  python3 curation_probe.py --selfcheck
-  python3 test_mutations.py
-)
+python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py
+python3 naru.py --selfcheck && python3 hook_spill.py --selfcheck
+python3 noise.py --selfcheck && python3 metrics.py --selfcheck
+python3 backend.py --selfcheck && python3 bench.py --selfcheck
+python3 beam.py --selfcheck && python3 regrade.py --selfcheck
+python3 curation_probe.py --selfcheck
+python3 test_mutations.py
 ```
 
-The block stops at the first failure. These checks run offline. The
-[CI workflow](.github/workflows/checks.yml) runs the same set on Python 3.9 and
-3.13, on Ubuntu and macOS, and checks that SQLite has FTS5 support.
+All of it is offline. CI runs the same set on 3.9 and 3.13.
 
-When you change the context policy, Jev adapter, experiment comparator, or
-their use in the agent loop, also run these offline checks. They are separate
-from the CI check set above:
+`python3 backend.py` and `python3 test_judge.py` without `--selfcheck` make
+live API calls and cost money. They are not in CI.
 
-```bash
-python3 context_policy.py
-python3 jev.py
-python3 experiment.py --selfcheck
-```
+## No dependencies
 
-`python3 backend.py` and `python3 test_judge.py` without `--selfcheck` make live
-model calls and can cost money. They are outside this offline check set.
+Standard library only. This is not a preference, it is the reason the install
+is a `git clone` and a symlink. A change that adds a dependency needs to argue
+why a few lines cannot cover it, and the answer is usually that they can.
 
-For a docs change, also check local links and run the commands you changed in
-a temporary store. Keep live calls separate from offline validation.
+## Every module has a runnable self-check, and it has to bite
 
-## Keep installation simple
+`test_mutations.py` breaks the code on purpose and requires the self-check to
+fail. It exists because four checks here once passed while the bug they named
+was live — two scenarios shared an output buffer, one assertion compared a
+value to itself, and two re-typed the production predicate instead of calling
+it.
 
-The runtime uses Python's standard library. Preserve the clone-and-symlink
-installation path. If a change needs a dependency, explain the requirement and
-the alternatives in the pull request before adding it.
+If you add an invariant, add a mutation for it. If your check passes when the
+code is broken, it is decoration.
 
-Use the shared shell-command interface for agent integrations. Add an
-abstraction or setting when current callers need it. Keep test-only behavior
-out of production code.
-
-## Test behavior through the real path
-
-Call the function that production code calls. A test that repeats the same
-expression can pass even when the application path breaks.
+The failure mode to avoid:
 
 ```python
-# Check the function used by main().
+# useless — re-types the production expression, stays green when main() changes
+assert [x for x in arms if x not in ("full", "rag", "naru")] == ["nauru"]
+
+# useful — calls the function main() calls
 assert unknown_arms(["full", "rag", "nauru"]) == ["nauru"]
 ```
 
-`test_mutations.py` deliberately changes production behavior and checks that
-the relevant self-check fails. When you add an invariant, add a mutation that
-shows the check detects its violation. Avoid assertions that compare a value
-with itself or share output buffers between independent scenarios.
+## Benchmark changes
 
-## Change a benchmark carefully
+Read `docs/adr/0002` and `docs/adr/0006` first.
 
-Read the [benchmark method](docs/benchmark.md) before changing measurement or
-reporting code.
+- **Never hardcode a measured constant.** A hardcoded harness floor once
+  produced a wrong published number, in the direction that flattered us.
+- **`rag` is the control.** It is what separates "programmatic access wins"
+  from "any retrieval beats stuffing". A run that omits it is flattering
+  itself.
+- **Report the noise floor.** `separability()` prints a paired McNemar verdict
+  with every run, Bonferroni-corrected across the arm pairs. Do not replace it
+  with overlapping confidence intervals; that discards the pairing.
+- **Do not quote `billed_input` or `net-of-harness` ratios.** The `claude`
+  CLI's usage dict does not reconcile across runs. Cost and `view` do.
+- Numbers here are not leaderboard-comparable. The judge is not LongMemEval's
+  official prompt, and the paper it implements already reports better numbers
+  against ten named baselines.
 
-- Measure the harness overhead for each run. Do not hardcode a measured
-  constant into a result.
-- Keep `rag` as the control when comparing retrieval methods.
-- Report repeated-run variation and paired McNemar results. Correct across
-  the planned arm pairs. Confidence-interval overlap does not replace a paired
-  test.
-- Exclude failed model or judge calls from paired accuracy tests and report
-  those failures separately.
-- Do not quote historical `billed_input` or `net-of-harness` ratios. The
-  recorded Claude CLI usage does not reconcile across those runs; model cost
-  and harness view measurements do.
-- Keep the judge caveat with the scores. This repository's results are not
-  comparable with the official LongMemEval leaderboard.
+## Decisions that look wrong get an ADR
 
-## Document and commit the change
+`docs/adr/NNNN-slug.md`. Title line, then context, decision, why. Several
+decisions in this repo look like mistakes to a fresh reader and are not —
+`prune` refusing to age out a promoted claim, the doc being a promoted subset
+rather than a render of the log, the harness floor being measured every run.
 
-Explain the context, decision, and reason for a design change in the pull
-request. Update public docs with the behavior they describe. Keep private
-development records out of this repository.
+If you find yourself explaining the same thing twice in review, it is an ADR.
+If an existing ADR is wrong, rewrite it rather than adding a second one that
+argues with it — 0003 is an example.
 
-Use Conventional Commits, such as `docs: clarify agent setup`. Keep the
-imperative subject within 50 characters, with no final period. Put a blank
-line before a body wrapped at 72 characters. Explain what changes and why.
-Do not add `Co-Authored-By` lines.
+## Commits
 
-## Report security issues
+Conventional Commits, plus the Tim Pope rules: subject 50 characters or less,
+imperative mood, no trailing period, blank line before the body, body wrapped
+at 72 explaining what and why rather than how.
 
-The research kernel executes model-written Python. Read its
-[execution limits](docs/research.md#execution-limits) before running it.
-If you report a vulnerability in an issue, describe the class of problem
-without publishing a working exploit.
+## Scope
 
-## Prepare a public release
+Things that will be turned down:
 
-Use the [release checklist](docs/public-release.md) when bringing changes into
-the public repository. Review both the content and the files included in the
-release.
+- A per-harness plugin API. Anything that can run a shell command is already
+  supported, and ADR 0004 says why that is the whole integration surface.
+- Speculative abstractions, config for a value that never changes, an
+  interface with one implementation.
+- Production code that exists to satisfy a test.
+
+## Security
+
+`kernel.py` executes model-authored Python in-process with no sandbox. That is
+a known limitation, disclosed in the README, and it is the highest-value thing
+anyone could fix. If you are reporting a vulnerability rather than fixing one,
+open an issue describing the class of problem without a working exploit.
