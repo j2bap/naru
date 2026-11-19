@@ -120,7 +120,11 @@ def main():
         print(f"  gold: {gold}")
         print(f"  cand: {cand}")
         print(f"  want {want}, got {got}")
-    return 1 if bad else 0
+    if be.usage.errors:
+        # A case with no majority returns WRONG by default. That matched every
+        # want=WRONG case and hid a judge that had parsed none of its votes.
+        print(f"\n{be.usage.errors} vote(s) were lost with no majority: those cases were not judged")
+    return 1 if bad or be.usage.errors else 0
 
 
 if __name__ == "__main__":

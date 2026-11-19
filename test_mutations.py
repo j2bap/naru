@@ -721,6 +721,12 @@ MUTATIONS = ISOLATION_MUTATIONS + [
         '    if est("\\n\\n".join(block.render() for block in blocks)) > budget:\n',
     ),
     (
+        'a judge verdict followed by a reason is a lost vote',
+        'bench.py',
+        '        v = lines[0].strip().upper() if lines else ""\n',
+        '        v = reply.strip().upper()\n',
+    ),
+    (
         "the inbox skips stale facts",
         "naru.py",
         "        pend, stale = ms.pending(), _stale(ms)\n",

@@ -368,11 +368,14 @@ def judge(q, response, backend, votes=3):
     counted = backend.usage.errors
     yes = no = lost = 0
     for i in range(votes):
-        v = (
-            backend(p, system=JUDGE_SYSTEM, nudge="(Reply with exactly one word.)")
-            .strip()
-            .upper()
-        )
+        reply = backend(p, system=JUDGE_SYSTEM, nudge="(Reply with exactly one word.)")
+        # The first line only. Haiku often gives the verdict and then explains
+        # it. Wanting the whole reply to be one word lost those votes: in a
+        # live run all three votes on one case said WRONG with a reason, and
+        # the judge counted none of them. A verdict inside a sentence is
+        # still refused.
+        lines = reply.strip().splitlines()
+        v = lines[0].strip().upper() if lines else ""
         if v == "CORRECT":
             yes += 1
         elif v == "WRONG":
@@ -1547,6 +1550,14 @@ def demo():
     assert malformed.usage.errors == 1
     exact = VerdictBackend(" correct \n")
     assert judge(judge_q, "a", exact, votes=1)
+    explained = VerdictBackend("WRONG\n\nThe candidate states the total, not the price.")
+    assert not judge(judge_q, "a", explained) and explained.usage.errors == 0, (
+        "a verdict followed by a reason was counted as a lost vote"
+    )
+    explained = VerdictBackend("CORRECT\n\nThe candidate states the gold fact.")
+    assert judge(judge_q, "a", explained) and explained.usage.errors == 0
+    buried = VerdictBackend("I think this is CORRECT")
+    assert not judge(judge_q, "a", buried, votes=1) and buried.usage.errors == 1
 
     # A lost vote is one error, whichever layer noticed it: the backend counts
     # a vote whose retries ran out, the judge a malformed verdict. When the
