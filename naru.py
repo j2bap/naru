@@ -47,6 +47,14 @@ a fact back into a session costs a few hundred tokens instead of everything you
 ever wrote.
 """
 
+import sys
+
+# Before the other imports, so an old Python prints this and not a traceback.
+# 3.11 is the oldest Python that still gets security fixes.
+if sys.version_info < (3, 11):
+    sys.exit(f"naru needs Python 3.11 or newer; this is Python "
+             f"{sys.version_info.major}.{sys.version_info.minor}")
+
 import contextlib
 import hashlib
 import io
@@ -55,7 +63,6 @@ import os
 import pathlib
 import shlex
 import subprocess
-import sys
 from datetime import datetime, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))

@@ -26,7 +26,7 @@ that implements and measures the paper Naru is built on. The
 
 ## Quick start
 
-You need Python 3.9 or later and a SQLite build with FTS5. Most Python builds
+You need Python 3.11 or later and a SQLite build with FTS5. Most Python builds
 include it.
 
 ```bash
@@ -457,7 +457,7 @@ loop.
 
 Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before you open a pull request. Every
 module has an offline self-check. CI runs this set on Ubuntu and macOS, with
-Python 3.9 and 3.13:
+Python 3.11 and 3.13:
 
 ```bash
 python3 ms.py && python3 kernel.py && python3 eviction.py && python3 agent.py

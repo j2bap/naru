@@ -15,7 +15,7 @@ python3 curation_probe.py --selfcheck
 python3 test_mutations.py
 ```
 
-All of it is offline. CI runs the same set on 3.9 and 3.13.
+All of it is offline. CI runs the same set on 3.11 and 3.13.
 
 `python3 backend.py` and `python3 test_judge.py` without `--selfcheck` make
 live API calls and cost money. They are not in CI.

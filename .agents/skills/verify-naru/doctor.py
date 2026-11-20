@@ -35,8 +35,8 @@ def main():
         stop("TMPDIR is not the run-only temp folder")
     if db == (pathlib.Path.home() / ".naru" / "log.db").resolve():
         stop("the database is the normal user store")
-    if sys.version_info < (3, 9):
-        stop("Python 3.9 or newer is required")
+    if sys.version_info < (3, 11):
+        stop("Python 3.11 or newer is required")
 
     try:
         with sqlite3.connect(":memory:") as probe:

@@ -8,20 +8,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The README claims 3.9+. The oldest and the newest prove it.
+        # The README claims 3.11+. The oldest and the newest prove it.
+        # 3.11 is the oldest Python that still gets security fixes, and the
+        # newest Ubuntu image no longer offers anything older than it needs.
         # macOS is not decoration: it refuses RLIMIT_AS, so the "a refused
         # limit reports itself refused" branch and the mutation that guards it
         # only ever execute there. Ubuntu-only, that check ran nowhere.
         os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.13"]
-        # ubuntu-latest became 26.04, which has no Python 3.9 build for
-        # setup-python. The 3.9 leg stays on the last image that has one.
-        exclude:
-          - os: ubuntu-latest
-            python: "3.9"
-        include:
-          - os: ubuntu-24.04
-            python: "3.9"
+        python: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
