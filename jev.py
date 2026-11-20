@@ -835,6 +835,13 @@ def demo():
     assert flood.usage.errors == 1 and flood._process is None
     flood.close()
 
+    # Needs the installed command. CI has none, and this unguarded check
+    # failed every run of the mutation suite there.
+    if shutil.which("jev"):
+        auto = CommandJev("jev mcp")
+        assert auto.protocol == "mcp" and auto.usage.transport == "mcp-stdio"
+        auto.close()
+
     wrapped = {
         "content": [{"type": "text", "text": json.dumps(response)}],
         "isError": False,

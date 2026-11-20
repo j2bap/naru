@@ -657,7 +657,10 @@ def demo():
     )
     assert k.run(unreadable) == ("", None)
     d = k.digest()
-    assert "n: <unreadable: ValueError>" in d, d
+    # Python 3.11 and later refuse to print an int that long. Earlier
+    # versions print it, so only `broken` is unreadable there.
+    int_limit = hasattr(sys, "get_int_max_str_digits")
+    assert ("n: <unreadable: ValueError>" in d) == int_limit, d
     assert "broken: <unreadable: RuntimeError>" in d and "after: int=1" in d, d
 
     # errors are captured, not raised, and the kernel survives
@@ -819,7 +822,8 @@ def demo():
         assert err and "KeyboardInterrupt" in err, err
         assert sk.run(unreadable) == ("", None)
         d = sk.digest()
-        assert "n: <unreadable: ValueError>" in d and "after: int=1" in d, d
+        assert ("n: <unreadable: ValueError>" in d) == int_limit, d
+        assert "broken: <unreadable: RuntimeError>" in d and "after: int=1" in d, d
         assert "xs: list[4]" in d, f"the child lost its state: {d}"
 
         # The log path must not stay in the child's environment: model code
