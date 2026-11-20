@@ -32,8 +32,8 @@ import metrics
 
 # One owner for the number. `naru stats` imports this value, so the reported
 # spill distribution and the hook use the same context-first threshold.
-THRESHOLD = int(os.environ.get("NARU_SPILL_THRESHOLD", "2400"))  # chars
-KEEP = int(os.environ.get("NARU_SPILL_PREVIEW", "600"))
+THRESHOLD = metrics.env_int("NARU_SPILL_THRESHOLD", 2400)  # chars
+KEEP = metrics.env_int("NARU_SPILL_PREVIEW", 600)
 SIGNPOST_EVERY = 40  # one signpost line per N lines of spilled text
 # Resolved lazily. Small results never open a store, and `import ms` costs
 # about 8 ms on every hook call. `ms` stays the one owner of the default path
@@ -315,6 +315,15 @@ def demo():
     assert p.returncode == 0 and not p.stdout.strip()
     # and neither must JSON that is not an event object
     assert run([1]) is None and run("text") is None
+    # A typo in a setting must not break every tool call either. The hook
+    # falls back to the default and still spills.
+    p = subprocess.run(
+        me, input=json.dumps({"tool_name": "Bash", "tool_response": {"stdout": big}}),
+        capture_output=True, text=True,
+        env={**env, "NARU_SPILL_THRESHOLD": "4k", "NARU_SPILL_PREVIEW": "lots"},
+    )
+    assert p.returncode == 0 and "updatedToolOutput" in p.stdout, p.stderr[-300:]
+    assert "NARU_SPILL_THRESHOLD='4k' is not a whole number" in p.stderr, p.stderr[-300:]
 
     saved = len(big) - len(upd["stdout"])
     print(

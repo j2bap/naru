@@ -39,3 +39,15 @@ go stale silently and the report will keep looking plausible.
 One extra cheap model call per benchmark run. `--harness-floor N` still forces a
 value for reproducing an old run. Any result printed before this change should
 be recomputed from its `results/*.json` rather than trusted.
+
+## Later changes
+
+`--harness-floor N` is checked before any paid call. A negative value is
+refused. A value given for a backend that reports no token counts is refused
+too, because it was dropped without a word.
+
+`experiment.py` once required the two runs to have the same `harness_floor`.
+Because each run measures its own floor, two honest runs differ by a few
+tokens, and the only way to pass was to pin the floor by hand, which is what
+this record says not to do. The floor is no longer a controlled variable in
+that comparison.

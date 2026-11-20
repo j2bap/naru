@@ -23,7 +23,27 @@ from datetime import datetime
 PATH = pathlib.Path(
     os.environ.get("NARU_METRICS", pathlib.Path.home() / ".naru" / "metrics.jsonl")
 )
-MAX_BYTES = int(os.environ.get("NARU_METRICS_MAX", 2_000_000))  # ~20k events
+
+
+def env_int(name, default):
+    """A whole-number setting from the environment.
+
+    These are read when a hook starts. A bare int() turned a typo such as
+    NARU_SPILL_THRESHOLD=4k into a crash on every tool call, and a hook must
+    never break one. A bad value falls back to the default and says so.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"naru: {name}={raw!r} is not a whole number; using {default}",
+              file=sys.stderr)
+        return default
+
+
+MAX_BYTES = env_int("NARU_METRICS_MAX", 2_000_000)  # ~20k events
 
 
 def record(event, **fields):
@@ -301,6 +321,18 @@ def demo():
     PATH = pathlib.Path(tmp.name) / "m.jsonl"
 
     assert report() == [f"no metrics yet ({PATH})"]
+
+    import contextlib
+    import io
+
+    os.environ["NARU_DEMO_INT"] = "12"
+    assert env_int("NARU_DEMO_INT", 5) == 12
+    os.environ["NARU_DEMO_INT"] = "4k"
+    with contextlib.redirect_stderr(io.StringIO()) as said:
+        assert env_int("NARU_DEMO_INT", 5) == 5, "a bad setting was not replaced by the default"
+    assert "NARU_DEMO_INT='4k'" in said.getvalue()
+    del os.environ["NARU_DEMO_INT"]
+    assert env_int("NARU_DEMO_INT", 5) == 5
 
     record("hook", harness="claude-code", tool="Bash", chars=500, spilled=False)
     record(

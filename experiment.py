@@ -82,7 +82,10 @@ CONFIG_FIELDS = (
 COMPATIBILITY_FIELDS = tuple(
     field
     for field in CONFIG_FIELDS
-    if field not in ("context_policy", "tokens_measured", "jev_command")
+    # harness_floor is measured at the start of each run (ADR 0002), so two
+    # honest runs differ by a few tokens. Requiring a match rejected every
+    # pair unless the floor was pinned by hand.
+    if field not in ("context_policy", "tokens_measured", "jev_command", "harness_floor")
 )
 
 
@@ -342,16 +345,11 @@ def _run_metrics(run, prices):
     ]
     effective_cost_measured = all(cost is not None for cost in effective_costs)
     total_cost = round(sum(effective_costs), 6) if effective_cost_measured else None
+    # Every row's cost, not only the successful rows'. A failed question was
+    # paid for too. Counting successes alone let a candidate that fails the
+    # expensive questions read as cheaper, and disagreed with bench.report().
     success_cost = (
-        round(
-            sum(
-                cost
-                for row, cost in zip(rows, effective_costs)
-                if _task_success(row)
-            )
-            / success,
-            6,
-        )
+        round(sum(effective_costs) / success, 6)
         if effective_cost_measured and success
         else None
     )
@@ -801,10 +799,19 @@ def demo():
         assert result["adoption"]["decision"] == "go", result
         assert result["candidate"]["metrics"]["context_selected_tokens_mean"] == 40
         assert result["candidate"]["metrics"]["jev_cost_usd_total"] == 0.000009
-        assert (
-            result["candidate"]["metrics"]["task_cost_usd_per_success"]
-            == 0.050003
-        )
+        # Every row's cost over the successes. The failed question cost
+        # $0.10 and must be in the numerator: 0.200009 / 2 successes.
+        cm = result["candidate"]["metrics"]
+        assert cm["task_cost_usd_total"] == 0.200009, cm
+        assert cm["task_cost_usd_per_success"] == 0.100005, cm
+        assert result["baseline"]["metrics"]["task_cost_usd_per_success"] == 0.25
+        # Each run measures its own harness floor, so the two differ by a few
+        # tokens. That must not block the comparison.
+        floor_path = root / "floor.json"
+        floor_path.write_text(json.dumps(
+            {**candidate, "config": {**candidate["config"], "harness_floor": 103}}))
+        assert compare_runs(base_path, floor_path, prices=prices)["adoption"][
+            "decision"] == "go", "a measured floor that differs blocked the comparison"
         assert "secret-question-1" not in json.dumps(result)
         unknown = compare_runs(base_path, candidate_path)
         assert unknown["adoption"]["decision"] == "defer", unknown

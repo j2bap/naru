@@ -76,6 +76,14 @@ itself.
   `bench.main` passes `(kind, command)` to each `get_backend` call. Workers
   that resolved `NARU_BACKEND` again turned a command named `codex` into the
   Codex adapter.
+- **A results file is never replaced, and a finished row is saved at once.**
+  `bench.main` picks a name that does not exist before the first paid call,
+  appends each row to `<name>.partial.jsonl` as it finishes, and writes the
+  final file before the report. An interrupted run keeps what it paid for.
+- **Cost per success is every row's cost over the successes**, in `bench.py`
+  and `experiment.py` alike. A failed question was paid for too.
+- **`experiment.py` does not require equal harness floors.** Each run measures
+  its own, so two honest runs differ by a few tokens.
 - **All arms must see identical history.** `sessions(q)` is the one source of
   ordering; do not re-derive it. `--arms` rejects an unknown name rather than
   falling through to `full`, because a typo would corrupt a paid run in silence.
@@ -107,6 +115,8 @@ itself.
   recorded an open covering both endpoints (ADR 0010). The check is in
   `naru.py`, not `ms.append`, because `agent.py` writes provenance for states
   whose reader used `ms.expand` and never touched `metrics`.
+- **Read an integer setting with `metrics.env_int`.** A bare `int()` at import
+  turned `NARU_SPILL_THRESHOLD=4k` into a crash on every tool call.
 - One owner for `NARU_SPILL_THRESHOLD`: the default in `hook_spill.py`. Setting
   it inline on the hook command makes `naru stats` judge the distribution
   against a threshold the hook never ran at.

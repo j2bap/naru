@@ -888,6 +888,20 @@ def one(
     return result(candidate, turns, peak, correct=ok, judge_backend=jb)
 
 
+def fresh_path(path):
+    """`path`, or the first `stem-2`, `stem-3`, ... that does not exist yet.
+
+    The results name is built from the tag, the split, and the question
+    count, so a second run with the same three silently replaced the first
+    one's paid rows.
+    """
+    candidate, n = path, 1
+    while candidate.exists():
+        n += 1
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+    return candidate
+
+
 def wilson(k, n, z=1.96):
     """95% confidence interval on a proportion, Wilson score.
 
@@ -1328,6 +1342,16 @@ def main():
         measured = probe_backend.reports_tokens
     finally:
         probe_backend.close()
+    # Checked here, before any paid call. A negative floor inflates the
+    # net-of-harness column, and a floor for a backend that reports no tokens
+    # was dropped without a word.
+    if a.harness_floor is not None and a.harness_floor < 0:
+        sys.exit("--harness-floor must be 0 or more")
+    if a.harness_floor is not None and not measured:
+        sys.exit(
+            "--harness-floor was given, but this backend reports no token "
+            "counts, so there is nothing to subtract it from"
+        )
     if a.harness_floor is None:
         a.harness_floor = measure_floor(
             a.model, backend=backend_kind, command=backend_command
@@ -1341,6 +1365,14 @@ def main():
             print(f"measured harness floor: {a.harness_floor:,} input tok/call")
 
     qs = load(a.split, a.n, qtype=a.qtype)
+    # Chosen before the first paid call, and never an existing file.
+    out = fresh_path(DATA.parent / "results" / f"{a.tag}_{a.split}_n{len(qs)}.json")
+    out.parent.mkdir(exist_ok=True)
+    # Each finished row is appended here at once. The results used to live
+    # in memory until one write at the end, so an interrupted run lost every
+    # answer it had paid for. A complete run removes this file.
+    partial = out.with_suffix(".partial.jsonl")
+    saved = open(partial, "w")
     print(
         f"LongMemEval-{a.split}  n={len(qs)}  arms={arms}  "
         f"backend={backend_kind}  model={a.model}  "
@@ -1476,6 +1508,8 @@ def main():
                         rsm_context_tokens=0,
                     )
             rows.append(r)
+            saved.write(json.dumps(r) + "\n")
+            saved.flush()
             mark = "+" if r["correct"] else "-"
             print(
                 f"\r  [{i}/{len(jobs)}] {mark} {r['arm']:6} {r['qid'][:22]:22}",
@@ -1486,12 +1520,9 @@ def main():
         host_jev.close()
     print()
 
-    for arm in arms:
-        report([r for r in rows if r["arm"] == arm], arm, a.harness_floor, measured)
-    separability(rows, arms)
-
-    out = DATA.parent / "results" / f"{a.tag}_{a.split}_n{len(qs)}.json"
-    out.parent.mkdir(exist_ok=True)
+    saved.close()
+    # Written before the report. A raise in report() or separability() used
+    # to leave nothing on disk.
     # vars(a) records the requested settings. Stamp the provider that actually
     # answered, and keep it separate from the model name for auditability.
     cfg = dict(vars(a))
@@ -1510,7 +1541,14 @@ def main():
     cfg["tokens_measured"] = measured
     cfg["pricing_version"] = os.environ.get("NARU_PRICING_VERSION") or None
     cfg["prompt_tokens_estimated"] = True
-    json.dump({"config": cfg, "rows": rows}, open(out, "w"), indent=1)
+    with open(out, "w") as handle:
+        json.dump({"config": cfg, "rows": rows}, handle, indent=1)
+    partial.unlink()
+
+    for arm in arms:
+        report([r for r in rows if r["arm"] == arm], arm, a.harness_floor, measured)
+    separability(rows, arms)
+
     print(f"\nwrote {out}")
 
 
@@ -1862,10 +1900,58 @@ def demo():
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             main()
-        crashed = json.loads(
-            (pathlib.Path(run_root) / "results" / "crash_oracle_n1.json").read_text()
+        results = pathlib.Path(run_root) / "results"
+        first_text = (results / "crash_oracle_n1.json").read_text()
+        crashed = json.loads(first_text)
+        first_built = list(built)
+        assert not list(results.glob("*.partial.jsonl")), (
+            "a complete run left its partial file behind"
         )
-    assert built == [
+
+        def rerun(*extra, expect=None):
+            with patch.object(sys, "argv", [*sys.argv, *extra]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    main()
+                except (RuntimeError, SystemExit) as stop:
+                    return stop
+            return None
+
+        # The same tag, split, and count again: a new file, not the old one.
+        assert rerun() is None
+        assert (results / "crash_oracle_n1.json").read_text() == first_text, (
+            "a second run with the same name replaced the first"
+        )
+        assert (results / "crash_oracle_n1-2.json").exists()
+        # A raise in the report comes after the results are on disk.
+        with patch.object(me, "separability", record("report", RuntimeError)):
+            assert isinstance(rerun(), RuntimeError)
+        assert (results / "crash_oracle_n1-3.json").exists(), (
+            "a raise in the report lost the run"
+        )
+        # A run that dies before its final write keeps each finished row.
+        with patch.object(me, "backend_provenance", record("config", RuntimeError)):
+            assert isinstance(rerun(), RuntimeError)
+        left = list(results.glob("*.partial.jsonl"))
+        assert [p.name for p in left] == ["crash_oracle_n1-4.partial.jsonl"], left
+        kept = [json.loads(line) for line in left[0].read_text().splitlines()]
+        assert [r["qid"] for r in kept] == [synth["question_id"]], kept
+        assert not (results / "crash_oracle_n1-4.json").exists()
+        # A floor is checked before any paid call: never negative, and never
+        # for a backend that reports no tokens to subtract it from.
+        calls = len(built)
+        for floor, why in (("-5", "0 or more"), ("5", "reports no token counts")):
+            stop = rerun("--harness-floor", floor)
+            assert isinstance(stop, SystemExit) and why in str(stop.code), (floor, stop)
+        assert [name for name, *_ in built[calls:]] == ["probe", "probe"], built[calls:]
+    with tempfile.TemporaryDirectory() as names:
+        taken = pathlib.Path(names) / "run.json"
+        assert fresh_path(taken) == taken
+        taken.write_text("{}")
+        assert fresh_path(taken).name == "run-2.json"
+        (pathlib.Path(names) / "run-2.json").write_text("{}")
+        assert fresh_path(taken).name == "run-3.json"
+    assert first_built == [
         (name, "command", "codex") for name in ("probe", "floor", "worker")
     ], built
     assert crashed["config"]["resolved_backend"] == "command", crashed["config"]
